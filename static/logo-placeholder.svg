@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="K2 Press placeholder logo">
+  <rect width="128" height="128" fill="#0A0F1E"/>
+  <path d="M24 90V38h12v21l22-21h16L49 62l27 28H59L36 65v25H24z" fill="#FFFFFF"/>
+  <path d="M76 90V78l22-17c5-4 8-8 8-12 0-5-4-8-10-8-7 0-12 4-17 11l-9-7c7-10 15-15 27-15 13 0 22 7 22 18 0 9-5 15-14 22L93 79h27v11H76z" fill="#00B4C8"/>
+  <rect x="24" y="100" width="80" height="8" fill="#00C896"/>
+</svg>

@@ -1,0 +1,9 @@
+feedparser
+PyYAML
+Jinja2
+playwright
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+openai

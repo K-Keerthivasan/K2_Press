@@ -1,0 +1,94 @@
+/* K2 Digital Media — brand CSS variables + slide base styles */
+:root {
+  --navy:  #0A0F1E;
+  --teal:  #00B4C8;
+  --green: #00C896;
+  --white: #FFFFFF;
+  --font:  Calibri, Arial, sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  width: 1080px;
+  height: 1350px;
+  margin: 0;
+  padding: 0;
+  font-family: var(--font);
+  color: var(--white);
+  background: var(--navy);
+  overflow: hidden;
+}
+
+/* ─── Base slide container ─────────────────────────────────────────────── */
+.slide {
+  position: relative;
+  width: 1080px;
+  height: 1350px;
+  overflow: hidden;
+  background: var(--navy);
+}
+
+/* Dark vignette — strong enough so text always wins over background image */
+.slide::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  /* Two-stop wash: a flat navy tint for brand consistency, deepening toward
+     the bottom where copy sits so captions always win over the photo. */
+  background:
+    linear-gradient(185deg,
+      rgba(10,15,30,0.58) 0%,
+      rgba(10,15,30,0.78) 55%,
+      rgba(10,15,30,0.95) 100%),
+    rgba(10,15,30,0.32);
+  z-index: 1;
+  pointer-events: none;
+}
+
+/* ─── Background image ─────────────────────────────────────────────────── */
+/* Muted + navy-tinted so the photo reads as branded texture, not a focal
+   point. Adjust --bg-mute / --bg-tint here to taste. */
+.bg-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 0;
+  filter: saturate(0.55) brightness(0.78) contrast(1.05);
+}
+
+/* ─── Watermark — large faded logo, bottom-right ──────────────────────── */
+.wm {
+  position: absolute;
+  right: -70px;
+  bottom: -50px;
+  width: 620px;
+  height: 620px;
+  object-fit: contain;
+  opacity: 0.07;
+  z-index: 1;
+  pointer-events: none;
+  user-select: none;
+  filter: grayscale(1) brightness(2.5);
+}
+
+/* ─── Outro teal gradient ──────────────────────────────────────────────── */
+.outro-bg {
+  background: linear-gradient(148deg, #00B4C8 0%, #0A0F1E 68%);
+}
+.outro-bg::before {
+  background: linear-gradient(185deg,
+    rgba(10,15,30,0.10) 0%,
+    rgba(10,15,30,0.60) 100%);
+}
+
+/* ─── Teal divider rule ────────────────────────────────────────────────── */
+.teal-rule {
+  display: block;
+  width: 58px;
+  height: 3px;
+  background: var(--teal);
+  border-radius: 2px;
+}

@@ -1,0 +1,93 @@
+app:
+  name: "K2 Digital Media"
+
+brand:
+  name:      "K2 Digital Media"
+  author:    "Keerthivasan"
+  handle:    "@k2digitalmedia_"
+  instagram: "k2digitalmedia_"
+  logo_path: "static/logo.png"
+
+llm:
+  base_url: "http://localhost:11434/v1"
+  model:    "qwen3:8b"
+  format:   "json"
+
+output:
+  width:     1080
+  height:    1350
+  directory: "outputs"
+
+slides:
+  min_content_cards: 1    # min total = 3 (title + 1 + outro)
+  max_content_cards: 8    # max total = 10 (title + 8 + outro)
+  default_total:     4    # default total slides
+  short_story:
+    max_summary_words: 220
+    content_cards:     2
+  long_story:
+    min_summary_words: 221
+    content_cards:     4
+
+# Post formats. "carousel" is multi-slide; the rest are single-card posts.
+formats:
+  carousel:
+    name:   "Carousel"
+    width:  1080
+    height: 1350
+    type:   multi
+  square:
+    name:     "Square Post"
+    width:    1080
+    height:   1080
+    type:     single
+    template: square.html
+  story:
+    name:     "Story"
+    width:    1080
+    height:   1920
+    type:     single
+    template: story.html
+  x:
+    name:     "X / Twitter"
+    width:    1600
+    height:   900
+    type:     single
+    template: xpost.html
+
+feeds:
+  sample_url: "https://feeds.bbci.co.uk/news/world/rss.xml"
+
+  categories:
+
+    web_development:
+      name:    "Web Development & Design"
+      enabled: true
+      urls:
+        - "https://www.smashingmagazine.com/feed"
+        - "https://css-tricks.com/feed"
+        - "https://blog.codepen.io/feed"
+        - "https://github.blog/feed"
+        - "https://stackoverflow.blog/feed"
+
+    digital_marketing:
+      name:    "Digital Marketing & SEO"
+      enabled: true
+      urls:
+        - "https://moz.com/feeds/blog.rss"
+        - "https://blog.hubspot.com/marketing/rss.xml"
+        - "https://searchengineland.com/feed"
+        - "https://www.marketingdive.com/feeds/news"
+        - "https://digitalagencynetwork.com/feed"
+
+    tech_business:
+      name:    "Tech & Business"
+      enabled: true
+      urls:
+        - "https://techcrunch.com/feed"
+
+    custom:
+      name:    "Custom / Local"
+      enabled: false
+      urls:
+        - "TODO: add your local London Ontario news feeds here"

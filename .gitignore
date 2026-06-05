@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+outputs/
+image_cache/
+.pytest_cache/
+node_modules/
+*.bak
+test_*.png
