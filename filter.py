@@ -25,15 +25,14 @@ def _load_profile() -> str:
     return PROFILE_PATH.read_text(encoding="utf-8")
 
 
-def _score_one(story: Story, profile: str, model: str | None = None) -> ScoredStory:
+def _score_one(story: Story, profile: str, brand_name: str = "the brand",
+               model: str | None = None) -> ScoredStory:
     system = (
-        "You are a content relevance judge for K2 Digital Media, a digital agency in "
-        "London, Ontario that posts Instagram carousels.\n\n"
+        f"You are a content relevance judge for {brand_name}, which posts Instagram content.\n\n"
         f"CREATOR PROFILE:\n{profile}\n\n"
-        "Score the story 0-100 for how well it fits as carousel content for this brand and "
-        "its audience of local business owners and marketers. Reward stories that map onto "
-        "the niche topics AND can be made actionable; penalise hard news, crime, politics, "
-        "and gossip. Return ONLY valid JSON:\n"
+        "Score the story 0-100 for how well it fits as a post for this brand and its "
+        "audience. Reward stories that map onto the niche AND can be turned into an engaging "
+        "post; penalise off-topic material. Return ONLY valid JSON:\n"
         '{"score": <int 0-100>, "reason": "<one sentence why it does or does not fit>"}'
     )
     user = (
@@ -52,16 +51,32 @@ def _score_one(story: Story, profile: str, model: str | None = None) -> ScoredSt
     )
 
 
-def rank_stories(stories: list[Story], top_n: int = 5, model: str | None = None) -> list[ScoredStory]:
-    profile = _load_profile()
+def rank_stories(stories: list[Story], top_n: int = 5, model: str | None = None,
+                 brand: dict | None = None, should_cancel=None) -> list[ScoredStory]:
+    if brand:
+        profile    = (brand.get("profile") or "").strip() or _safe_profile()
+        brand_name = brand.get("name", "the brand")
+    else:
+        profile    = _safe_profile()
+        brand_name = "K2 Digital Media"
     scored: list[ScoredStory] = []
     for s in stories:
+        if should_cancel and should_cancel():
+            print(f"[filter] cancelled — scored {len(scored)} before stopping")
+            break
         try:
-            scored.append(_score_one(s, profile, model))
+            scored.append(_score_one(s, profile, brand_name, model))
         except Exception as exc:
             print(f"[filter] WARN  '{s.title[:60]}': {exc}")
     scored.sort(key=lambda x: x.score, reverse=True)
     return scored[:top_n]
+
+
+def _safe_profile() -> str:
+    try:
+        return _load_profile()
+    except OSError:
+        return "A social media brand."
 
 
 def main() -> None:

@@ -1,10 +1,36 @@
+# ── Secrets / env ──────────────────────────────────────────────
 .env
+.env.*
+!.env.example
+
+# ── Python ─────────────────────────────────────────────────────
 .venv/
+venv/
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Node (canvas/codemirror tooling, if any) ──────────────────
+node_modules/
+
+# ── App-generated content (not source) ────────────────────────
 outputs/
 image_cache/
-.pytest_cache/
-node_modules/
+library/
+.active_brand
 *.bak
 test_*.png
+
+# ── Editors / OS cruft ─────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.log
+.DS_Store
+Thumbs.db
+
+# NOTE: static/fonts/ (bundled Roboto Mono) IS committed — required for
+# offline rendering, so it is intentionally NOT ignored.

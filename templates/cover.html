@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="{{ css_path }}">
+  <style>{{ theme_css }}</style>
+  <style>
+    /* Pure brand splash — keep the navy clean, no photo overlay. */
+    .cover-slide::before { display: none; }
+
+    .layer {
+      position: relative;
+      z-index: 2;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      padding: 80px 88px 84px;
+    }
+
+    .top-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .tag {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      color: #fff;
+      text-transform: uppercase;
+    }
+    .tag .sq {
+      width: 18px; height: 18px;
+      background: var(--teal);
+      border-radius: 3px;
+    }
+    .handle-top { font-size: 22px; font-weight: 500; color: rgba(255,255,255,0.6); }
+
+    .center {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      gap: 18px;
+    }
+    .wordmark {
+      margin: 0;
+      font-size: 270px;
+      font-weight: 700;
+      line-height: 0.9;
+      color: #fff;
+      letter-spacing: -6px;
+      text-shadow: 0 0 50px rgba(220,235,255,0.35);
+    }
+    .word-sub {
+      margin: 0;
+      font-size: 60px;
+      font-weight: 400;
+      letter-spacing: 8px;
+      color: rgba(255,255,255,0.82);
+      text-transform: uppercase;
+    }
+    .rule-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin: 26px 0 8px;
+    }
+    .rule-row .seg {
+      width: 92px; height: 3px;
+      background: linear-gradient(90deg, var(--teal), var(--green));
+      border-radius: 2px;
+    }
+    .rule-row .dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--teal);
+    }
+    .pitch {
+      margin: 0;
+      font-size: 30px;
+      font-weight: 500;
+      font-style: italic;
+      color: rgba(255,255,255,0.85);
+    }
+    .services {
+      margin: 0;
+      font-size: 25px;
+      font-weight: 400;
+      letter-spacing: 1px;
+      color: rgba(255,255,255,0.5);
+    }
+
+    .bottom {
+      display: flex;
+      justify-content: center;
+    }
+  </style>
+</head>
+<body>
+<main class="slide cover-slide">
+  <img class="wm" src="{{ logo_path }}" style="{{ wm_style }}" alt="">
+
+  <div class="layer">
+    <div class="top-bar">
+      <span class="tag"><span class="sq"></span>{{ category or brand.category }}</span>
+      <span class="handle-top">{{ handle }}</span>
+    </div>
+
+    <div class="center">
+      <h1 class="wordmark">{{ brand.short }}</h1>
+      {% if ' ' in brand.name %}
+      <p class="word-sub">{{ brand.name.split(' ', 1)[1] }}</p>
+      {% endif %}
+      <div class="rule-row">
+        <span class="seg"></span><span class="dot"></span><span class="seg"></span>
+      </div>
+      <p class="pitch">{{ brand.pitch }}</p>
+      <p class="services">{{ brand.services }}</p>
+    </div>
+
+    <div class="bottom">
+      <span class="meta-line">{{ brand.location }} · {{ brand.website }}</span>
+    </div>
+  </div>
+</main>
+</body>
+</html>

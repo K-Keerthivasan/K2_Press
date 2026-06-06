@@ -16,6 +16,13 @@ def _profile() -> str:
     return PROFILE_PATH.read_text(encoding="utf-8")
 
 
+def _safe_profile() -> str:
+    try:
+        return _profile()
+    except OSError:
+        return "A social media brand."
+
+
 def _auto_content_cards(story: Story, config: dict) -> int:
     words     = len(story.summary.split())
     threshold = config.get("slides", {}).get("short_story", {}).get("max_summary_words", 220)
@@ -29,30 +36,38 @@ def plan_story(
     config: dict | None = None,
     total_slides: int | None = None,   # explicit override (3-10)
     model: str | None = None,
+    brand: dict | None = None,
 ) -> dict:
     if config is None:
         config = load_config()
+    if brand is None:
+        from brands import resolve_brand
+        brand = resolve_brand(config)
 
     if total_slides is not None:
         n_content = max(1, min(8, total_slides - 2))
     else:
         n_content = _auto_content_cards(story, config)
-        default_total = config.get("slides", {}).get("default_total", 4)
         # cap to max
         max_c = config.get("slides", {}).get("max_content_cards", 8)
         n_content = min(n_content, max_c)
 
-    total = 1 + n_content + 1
-    handle  = config.get("brand", {}).get("handle", "@k2digitalmedia_")
-    profile = _profile()
+    total      = 1 + n_content + 1
+    brand_name = brand.get("name", "the brand")
+    handle     = brand.get("handle", "@handle")
+    profile    = (brand.get("profile") or "").strip() or _safe_profile()
+    tags       = json.dumps(brand.get("hashtags", ["news"]))
+    location   = brand.get("location", "")
+    loc_rule   = (f"- Make {location} relevance explicit when it is not obvious.\n"
+                  if location else "")
+    extra_ctx  = (brand.get("tone") or "")  # optional per-plan/brand tone hint
 
-    system = f"""You are an Instagram carousel content planner for K2 Digital Media, a full-service
-digital agency (web, video, marketing, IT) based in London, Ontario, Canada.
+    system = f"""You are an Instagram carousel content planner for {brand_name}.
 You write clear, value-first posts — no fluff, no hype.
 
 CREATOR PROFILE:
 {profile}
-
+{extra_ctx}
 Return ONE valid JSON object (no markdown, no code fences) with EXACTLY these keys:
 {{
   "slug": "<kebab-case, max 40 chars>",
@@ -73,7 +88,7 @@ Return ONE valid JSON object (no markdown, no code fences) with EXACTLY these ke
     "handle": "{handle}"
   }},
   "caption":    "<Instagram caption, 3-4 sentences, no hashtags>",
-  "hashtags":   ["london", "ontario", "digitalmedia"],
+  "hashtags":   {tags},
   "dm_keyword": "<one word>"
 }}
 
@@ -81,8 +96,7 @@ RULES:
 - content_slides MUST have EXACTLY {n_content} items.
 - Every slide leads with value first, not background context.
 - CTA is ONE action only (follow / DM / save / share).
-- Make local London ON relevance explicit when it is not obvious.
-- image_query must be a Pexels-compatible phrase (e.g. "city skyline night").
+{loc_rule}- image_query must be a Pexels-compatible phrase (e.g. "city skyline night").
 - Body bullets use em-dash format: — point one\\n— point two"""
 
     user = (
@@ -101,13 +115,22 @@ def plan_single(
     fmt: str,                    # "square" | "story" | "x"
     config: dict | None = None,
     model: str | None = None,
+    brand: dict | None = None,
 ) -> dict:
     """Plan a single-card post. Returns format-appropriate JSON."""
     if config is None:
         config = load_config()
+    if brand is None:
+        from brands import resolve_brand
+        brand = resolve_brand(config)
 
-    handle  = config.get("brand", {}).get("handle", "@k2digitalmedia_")
-    profile = _profile()
+    brand_name = brand.get("name", "the brand")
+    handle     = brand.get("handle", "@handle")
+    profile    = (brand.get("profile") or "").strip() or _safe_profile()
+    tags       = json.dumps(brand.get("hashtags", ["news"]))
+    location   = brand.get("location", "")
+    loc_rule   = (f"- Make {location} relevance explicit when it is not obvious.\n"
+                  if location else "")
 
     fmt_notes = {
         "square": "A single square (1080x1080) Instagram feed post. One bold headline plus "
@@ -126,8 +149,8 @@ def plan_single(
     if fmt == "x":
         extra_keys = '  "tweet_text": "<the X post text, under 270 chars, 1-2 inline hashtags>",\n'
 
-    system = f"""You are a content planner for K2 Digital Media, a digital agency (web, video,
-marketing, IT) in London, Ontario. You write clear, value-first social posts — no fluff.
+    system = f"""You are a content planner for {brand_name}. You write clear, value-first
+social posts — no fluff.
 
 CREATOR PROFILE:
 {profile}
@@ -142,15 +165,14 @@ Return ONE valid JSON object (no markdown, no code fences) with EXACTLY these ke
   "body": "<2-3 points, each starting with an em-dash, each on its own line>",
   "image_query": "<2-4 word Pexels/Unsplash phrase that fits this post>",
 {extra_keys}  "caption": "<platform caption, 2-4 sentences, no hashtags>",
-  "hashtags": ["london", "ontario", "digitalmedia"],
+  "hashtags": {tags},
   "dm_keyword": "<one word>"
 }}
 
 RULES:
 - Lead with value, not background.
 - One clear CTA only.
-- Make local London ON relevance explicit when not obvious.
-- Do not invent facts beyond the source story."""
+{loc_rule}- Do not invent facts beyond the source story."""
 
     user = (
         f"Story title:   {story.title}\n"
@@ -168,13 +190,49 @@ def plan_post(
     config: dict | None = None,
     total_slides: int | None = None,
     model: str | None = None,
+    brand: dict | None = None,
 ) -> dict:
     """Dispatch: carousel -> multi-slide plan; everything else -> single-card plan."""
     if fmt == "carousel":
-        plan = plan_story(story, config, total_slides=total_slides, model=model)
+        plan = plan_story(story, config, total_slides=total_slides, model=model, brand=brand)
         plan.setdefault("format", "carousel")
         return plan
-    return plan_single(story, fmt, config=config, model=model)
+    if fmt == "cover":
+        # The brand-cover card is purely static brand furniture — no LLM call.
+        return {"format": "cover", "slug": "brand-cover"}
+    return plan_single(story, fmt, config=config, model=model, brand=brand)
+
+
+def regen_caption(plan: dict, brand: dict | None = None, config: dict | None = None,
+                  model: str | None = None, tone: str = "") -> dict:
+    """Regenerate just the caption + hashtags from an existing plan's content."""
+    if config is None:
+        config = load_config()
+    if brand is None:
+        from brands import resolve_brand
+        brand = resolve_brand(config)
+    brand_name = brand.get("name", "the brand")
+    tags       = json.dumps(brand.get("hashtags", ["news"]))
+
+    parts: list[str] = []
+    tc = plan.get("title_card", {}) or {}
+    parts += [tc.get("headline", ""), tc.get("subhead", "")]
+    for s in plan.get("content_slides", []) or []:
+        parts += [s.get("heading", ""), s.get("body", "")]
+    parts += [plan.get("headline", ""), plan.get("body", ""), plan.get("caption", "")]
+    content = "\n".join(p for p in parts if p)
+    tone_line = f"Desired tone: {tone}\n" if tone else ""
+
+    system = f"""You write Instagram captions for {brand_name}.
+{tone_line}Return ONE valid JSON object (no markdown) with EXACTLY these keys:
+{{"caption": "<engaging 3-4 sentence caption, no hashtags>", "hashtags": {tags}}}
+Rules: caption is on-brand and value-first; provide 6-12 relevant hashtags (lowercase, no #)."""
+    user = f"Post content:\n{content[:1400]}"
+    res  = chat_json(system, user, model=model)
+    tags_out = res.get("hashtags", [])
+    if isinstance(tags_out, str):
+        tags_out = [t.strip().lstrip("#") for t in tags_out.split() if t.strip()]
+    return {"caption": res.get("caption", ""), "hashtags": tags_out}
 
 
 def main() -> None:

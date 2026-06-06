@@ -1,10 +1,27 @@
 /* K2 Digital Media — brand CSS variables + slide base styles */
+
+/* ── Roboto Mono (bundled locally so rendering works offline) ───────────── */
+@font-face{
+  font-family:'Roboto Mono'; font-style:normal; font-weight:400; font-display:block;
+  src:url('fonts/RobotoMono-400.woff2') format('woff2');
+}
+@font-face{
+  font-family:'Roboto Mono'; font-style:normal; font-weight:500; font-display:block;
+  src:url('fonts/RobotoMono-500.woff2') format('woff2');
+}
+@font-face{
+  font-family:'Roboto Mono'; font-style:normal; font-weight:700; font-display:block;
+  src:url('fonts/RobotoMono-700.woff2') format('woff2');
+}
+
 :root {
   --navy:  #0A0F1E;
+  --navy-2:#0C1426;
   --teal:  #00B4C8;
   --green: #00C896;
   --white: #FFFFFF;
-  --font:  Calibri, Arial, sans-serif;
+  --font:  'Roboto Mono', 'Cascadia Mono', 'Consolas', monospace;
+  --frame: rgba(255,255,255,0.11);
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -18,6 +35,7 @@ html, body {
   color: var(--white);
   background: var(--navy);
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
 /* ─── Base slide container ─────────────────────────────────────────────── */
@@ -26,29 +44,39 @@ html, body {
   width: 1080px;
   height: 1350px;
   overflow: hidden;
-  background: var(--navy);
+  /* Soft teal-navy glow toward the upper third, deepening to near-black at
+     the edges — the subtle vignette seen across the example posts. */
+  background:
+    radial-gradient(125% 85% at 50% 30%,
+      #17263f 0%, #101a2e 40%, #0b1120 70%, #070b14 100%);
 }
 
-/* Dark vignette — strong enough so text always wins over background image */
+/* Dark vignette so copy always wins over any background photo. */
 .slide::before {
   content: '';
   position: absolute;
   inset: 0;
-  /* Two-stop wash: a flat navy tint for brand consistency, deepening toward
-     the bottom where copy sits so captions always win over the photo. */
   background:
     linear-gradient(185deg,
-      rgba(10,15,30,0.58) 0%,
-      rgba(10,15,30,0.78) 55%,
-      rgba(10,15,30,0.95) 100%),
-    rgba(10,15,30,0.32);
+      rgba(8,12,22,0.55) 0%,
+      rgba(8,12,22,0.74) 55%,
+      rgba(8,12,22,0.92) 100%);
   z-index: 1;
   pointer-events: none;
 }
 
+/* Thin inset frame around every slide (matches the example border). */
+.slide::after {
+  content: '';
+  position: absolute;
+  inset: 30px;
+  border: 1px solid var(--frame);
+  border-radius: 16px;
+  z-index: 4;
+  pointer-events: none;
+}
+
 /* ─── Background image ─────────────────────────────────────────────────── */
-/* Muted + navy-tinted so the photo reads as branded texture, not a focal
-   point. Adjust --bg-mute / --bg-tint here to taste. */
 .bg-image {
   position: absolute;
   inset: 0;
@@ -56,32 +84,33 @@ html, body {
   height: 100%;
   object-fit: cover;
   z-index: 0;
-  filter: saturate(0.55) brightness(0.78) contrast(1.05);
+  filter: saturate(0.55) brightness(0.72) contrast(1.05);
 }
 
-/* ─── Watermark — large faded logo, bottom-right ──────────────────────── */
+/* ─── Watermark — large faded K2 mark, centred ────────────────────────── */
 .wm {
   position: absolute;
-  right: -70px;
-  bottom: -50px;
-  width: 620px;
-  height: 620px;
+  left: 50%;
+  top: 55%;
+  transform: translate(-50%, -50%);
+  width: 760px;
+  height: 760px;
   object-fit: contain;
-  opacity: 0.07;
+  opacity: 0.05;
   z-index: 1;
   pointer-events: none;
   user-select: none;
-  filter: grayscale(1) brightness(2.5);
+  filter: grayscale(1) brightness(2.4);
 }
 
-/* ─── Outro teal gradient ──────────────────────────────────────────────── */
+/* ─── Outro accent gradient (recolours per brand via --teal/--navy) ─────── */
 .outro-bg {
-  background: linear-gradient(148deg, #00B4C8 0%, #0A0F1E 68%);
+  background: linear-gradient(150deg, var(--teal) 0%, var(--navy) 62%);
 }
 .outro-bg::before {
   background: linear-gradient(185deg,
-    rgba(10,15,30,0.10) 0%,
-    rgba(10,15,30,0.60) 100%);
+    rgba(10,15,30,0.12) 0%,
+    rgba(10,15,30,0.62) 100%);
 }
 
 /* ─── Teal divider rule ────────────────────────────────────────────────── */
@@ -92,3 +121,37 @@ html, body {
   background: var(--teal);
   border-radius: 2px;
 }
+
+/* ═══ Shared brand components (used across templates) ════════════════════ */
+
+/* Brand lock-up: round K2 mark + name + tagline (top-left of cards). */
+.lockup { display: flex; align-items: center; gap: 16px; }
+.lockup .mark {
+  width: 60px; height: 60px; border-radius: 50%;
+  object-fit: cover; flex-shrink: 0;
+}
+.lockup .l-text { display: flex; flex-direction: column; gap: 5px; }
+.lockup .l-name {
+  font-size: 28px; font-weight: 700; line-height: 1;
+  color: #fff; letter-spacing: -0.5px;
+}
+.lockup .l-tag {
+  font-size: 15px; font-weight: 400; line-height: 1;
+  color: rgba(255,255,255,0.42); font-style: italic; letter-spacing: 0.2px;
+}
+
+/* Centred brand badge for card footers: round mark + name. */
+.badge-brand { display: flex; align-items: center; justify-content: center; gap: 13px; }
+.badge-brand .b-mark {
+  width: 46px; height: 46px; border-radius: 50%; object-fit: cover;
+}
+.badge-brand .b-name {
+  font-size: 25px; font-weight: 700; color: #fff; letter-spacing: -0.3px;
+}
+
+/* Small muted meta lines (handle / contact). */
+.meta-line {
+  font-size: 18px; font-weight: 400; letter-spacing: 1px;
+  color: rgba(255,255,255,0.45);
+}
+.meta-line.center { text-align: center; }

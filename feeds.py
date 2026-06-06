@@ -108,18 +108,26 @@ def normalize_entry(entry: dict) -> Story:
 
 def fetch_feed(url: str) -> list[Story]:
     parsed = feedparser.parse(url)
-    if parsed.bozo:
+    # feedparser flags `bozo` for harmless issues too (e.g. an encoding declared
+    # us-ascii but served as utf-8). If entries still parsed, use them; only treat
+    # it as an error when there's genuinely nothing to read.
+    if not parsed.entries:
         exception = getattr(parsed, "bozo_exception", None)
-        raise RuntimeError(f"Could not parse feed {url}: {exception}")
-
+        raise RuntimeError(f"Could not parse feed {url}: {exception or 'no entries'}")
+    if parsed.bozo:
+        print(f"[feeds] note: {url} parsed with a warning "
+              f"({getattr(parsed, 'bozo_exception', '')})")
     return [normalize_entry(entry) for entry in parsed.entries]
 
 
 def fetch_stories(urls: Iterable[str]) -> list[Story]:
     stories: list[Story] = []
     for url in urls:
-        stories.extend(fetch_feed(url))
-
+        try:
+            stories.extend(fetch_feed(url))
+        except Exception as exc:
+            # One unreachable/broken feed shouldn't sink the whole fetch.
+            print(f"[feeds] WARN skipping feed {url}: {exc}")
     return stories
 
 

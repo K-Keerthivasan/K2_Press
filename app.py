@@ -1,10 +1,13 @@
 """K2 Digital Media — carousel generator with live editor and canvas design tool."""
 from __future__ import annotations
 import asyncio
+import json
 import os
+import re
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +22,8 @@ load_dotenv()
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(title="K2 Digital Media")
 
-for _d in ("outputs", "image_cache"):
-    Path(_d).mkdir(exist_ok=True)
+for _d in ("outputs", "image_cache", "library", "library/plans", "library/stories"):
+    Path(_d).mkdir(parents=True, exist_ok=True)
 
 app.mount("/static",      StaticFiles(directory="static"),      name="static")
 app.mount("/outputs",     StaticFiles(directory="outputs"),      name="outputs")
@@ -36,6 +39,32 @@ _session: dict[str, Any] = {
     "image_paths":  {},   # {str(slide_idx): str path}
     "rendered_dir": None,
 }
+
+# Single-flight guard: only one heavy LLM job (fetch/plan/batch) at a time so a
+# page refresh + re-click can't stack overlapping Ollama runs.
+_busy: dict[str, Any] = {"job": None, "since": 0.0}
+_BUSY_TIMEOUT = 600  # seconds; stale lock auto-expires so we can never deadlock
+_cancel: dict[str, bool] = {"flag": False}  # cooperative cancel for loop jobs
+
+
+def _acquire(job: str) -> None:
+    """Claim the job slot, or raise 409 if another job is genuinely in flight."""
+    cur = _busy["job"]
+    if cur and (time.time() - _busy["since"]) < _BUSY_TIMEOUT:
+        raise HTTPException(409, f"A '{cur}' job is already running. Wait for it to finish.")
+    _busy["job"] = job
+    _busy["since"] = time.time()
+    _cancel["flag"] = False  # fresh job starts uncancelled
+
+
+def _release() -> None:
+    _busy["job"] = None
+    _busy["since"] = 0.0
+    _cancel["flag"] = False
+
+
+def _cancelled() -> bool:
+    return _cancel["flag"]
 
 
 def _cfg() -> dict:
@@ -55,27 +84,39 @@ def _sync_list_models():
 
 
 def _sync_fetch_stories(limit, top_n, category, model):
-    from dataclasses import asdict
-    from feeds import fetch_stories, configured_feed_urls, list_categories, load_config
+    from feeds import fetch_stories, configured_feed_urls, load_config
     from filter import rank_stories
+    from brands import resolve_brand, brand_feeds_config
     config = load_config()
-    urls = configured_feed_urls(config, category=category or None)
+    brand  = resolve_brand(config)
+    scoped = brand_feeds_config(config, brand)
+    urls = configured_feed_urls(scoped, category=category or None)
     if not urls:
-        urls_all = configured_feed_urls(config)
+        urls_all = configured_feed_urls(scoped)
         if not urls_all:
-            raise ValueError("No feed URLs found. Check config.yaml.")
+            raise ValueError(f"No feed URLs configured for brand '{brand.get('name','')}'.")
         urls = urls_all
     stories = fetch_stories(urls)[:limit]
-    ranked  = rank_stories(stories, top_n, model=model)
+    ranked  = rank_stories(stories, top_n, model=model, brand=brand,
+                           should_cancel=_cancelled)
     return [vars(r) for r in ranked]
 
 
 def _sync_generate_plan(story_dict, total_slides, model):
     from feeds import Story
     from plan import plan_story
+    from brands import resolve_brand
     story  = Story(**story_dict)
     config = _cfg()
-    return plan_story(story, config, total_slides=total_slides, model=model)
+    brand  = resolve_brand(config)
+    return plan_story(story, config, total_slides=total_slides, model=model, brand=brand)
+
+
+def _sync_regen_caption(plan, tone):
+    from plan import regen_caption
+    from brands import resolve_brand
+    config = _cfg()
+    return regen_caption(plan, brand=resolve_brand(config), config=config, tone=tone)
 
 
 def _sync_fetch_images(plan, source):
@@ -114,31 +155,42 @@ def _base_vars(plan):
 
 def _slide_vars(plan, slide_idx):
     from render import _uri
-    bv = _base_vars(plan)
-    n  = len(plan.get("content_slides", []))
+    from brands import brand_template
+    bv    = _base_vars(plan)
+    brand = bv.get("brand", {})
+    n     = len(plan.get("content_slides", []))
     if slide_idx == 0:
-        return "title.html", {**bv, "background_image": None}
+        # Image-forward brands lead the title with the first content image.
+        timg = None
+        if brand.get("image_forward"):
+            raw = _session["image_paths"].get("0")
+            timg = _uri(raw) if raw else None
+        return brand_template(brand, "title", "title.html"), {**bv, "background_image": timg}
     if 1 <= slide_idx <= n:
         i   = slide_idx - 1
         sl  = plan["content_slides"][i]
         raw = _session["image_paths"].get(str(i))
-        return "content.html", {
+        return brand_template(brand, "content", "content.html"), {
             **bv,
             "slide":            sl,
             "slide_number":     slide_idx,
             "background_image": _uri(raw) if raw else None,
         }
-    return "outro.html", {**bv, "background_image": None}
+    return brand_template(brand, "outro", "outro.html"), {**bv, "background_image": None}
 
 
 EDITABLE_FILES = {
-    "title.html":   Path("templates/title.html"),
-    "content.html": Path("templates/content.html"),
-    "outro.html":   Path("templates/outro.html"),
-    "square.html":  Path("templates/square.html"),
-    "story.html":   Path("templates/story.html"),
-    "xpost.html":   Path("templates/xpost.html"),
-    "brand.css":    Path("static/brand.css"),
+    "title.html":        Path("templates/title.html"),
+    "content.html":      Path("templates/content.html"),
+    "outro.html":        Path("templates/outro.html"),
+    "cover.html":        Path("templates/cover.html"),
+    "jkr_title.html":    Path("templates/jkr_title.html"),
+    "jkr_content.html":  Path("templates/jkr_content.html"),
+    "jkr_outro.html":    Path("templates/jkr_outro.html"),
+    "square.html":       Path("templates/square.html"),
+    "story.html":        Path("templates/story.html"),
+    "xpost.html":        Path("templates/xpost.html"),
+    "brand.css":         Path("static/brand.css"),
 }
 
 
@@ -149,17 +201,26 @@ def _sync_batch_run(items, model, source):
     from plan import plan_post
     from images import fetch_images_for_plan, fetch_image
     from render import generate_post
+    from brands import resolve_brand
 
     config    = _cfg()
+    brand     = resolve_brand(config)
     batch_dir = Path("outputs") / f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     results   = []
 
+    cancelled = False
     for item in items:
+        if _cancelled():
+            cancelled = True
+            break
         story = Story(**item["story"])
         for fmt in item.get("formats", ["carousel"]):
+            if _cancelled():
+                cancelled = True
+                break
             try:
                 plan = plan_post(story, fmt, config=config,
-                                 total_slides=item.get("total_slides"), model=model)
+                                 total_slides=item.get("total_slides"), model=model, brand=brand)
                 # images
                 if fmt == "carousel":
                     img_paths = fetch_images_for_plan(plan, source=source)
@@ -181,12 +242,14 @@ def _sync_batch_run(items, model, source):
                     "rel":     str(Path(out_dir).relative_to("outputs")).replace("\\", "/"),
                     "files":   files,
                     "caption": plan.get("caption", ""),
+                    "plan":    plan,
+                    "story":   item["story"],
                     "ok":      True,
                 })
             except Exception as e:
                 results.append({"title": story.title, "format": fmt, "ok": False, "error": str(e)})
 
-    return {"batch_dir": str(batch_dir), "results": results}
+    return {"batch_dir": str(batch_dir), "results": results, "cancelled": cancelled}
 
 
 # ── API: models ───────────────────────────────────────────────────────────────
@@ -218,21 +281,212 @@ async def api_batch_run(body: dict = Body(...)):
     source = body.get("source", "pexels")
     if not items:
         raise HTTPException(400, "No items selected.")
+    _apply_brand(body.get("brand"))
+    _acquire("batch")
     t0 = time.time()
     try:
         out = await _run(_sync_batch_run, items, model, source)
         out["elapsed"] = round(time.time() - t0, 1)
         return out
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
+    finally:
+        _release()
 
 
 # ── API: categories ───────────────────────────────────────────────────────────
 @app.get("/api/categories")
 async def api_categories():
     from feeds import list_categories, load_config
-    cats = list_categories(load_config())
-    return {"categories": cats}
+    from brands import resolve_brand, brand_feeds_config
+    config = load_config()
+    scoped = brand_feeds_config(config, resolve_brand(config))
+    return {"categories": list_categories(scoped)}
+
+
+# ── API: cancel ────────────────────────────────────────────────────────────────
+@app.post("/api/cancel")
+async def api_cancel():
+    """Ask the running loop job (fetch/batch) to stop after the current item."""
+    job = _busy["job"]
+    if job:
+        _cancel["flag"] = True
+        return {"ok": True, "cancelling": job}
+    return {"ok": False, "cancelling": None}
+
+
+# ── API: brands ────────────────────────────────────────────────────────────────
+@app.get("/api/brands")
+async def api_brands():
+    from brands import list_brands, active_key
+    config = _cfg()
+    return {"brands": list_brands(config), "active": active_key(config)}
+
+
+@app.get("/api/brand")
+async def api_brand():
+    from brands import resolve_brand, active_key
+    config = _cfg()
+    b = resolve_brand(config)
+    t = b.get("theme", {})
+    return {
+        "key":     active_key(config),
+        "name":    b.get("name", ""),
+        "short":   b.get("short", b.get("name", "")),
+        "handle":  b.get("handle", ""),
+        "tagline": b.get("tagline", ""),
+        "pitch":    b.get("pitch", ""),
+        "services": b.get("services", ""),
+        "location": b.get("location", ""),
+        "website":  b.get("website", ""),
+        "category": b.get("category", ""),
+        "logo":    "/" + b.get("logo_path", "static/logo.png"),
+        "shape":   b.get("logo_shape", "round"),
+        "accent":  t.get("accent", "#00B4C8"),
+        "accent2": t.get("accent2", "#00C896"),
+        "navy":    t.get("navy", "#0A0F1E"),
+        "text":    t.get("text", "#FFFFFF"),
+    }
+
+
+@app.put("/api/brand")
+async def api_set_brand(body: dict = Body(...)):
+    from brands import set_active, resolve_brand, active_key, list_brands
+    key = body.get("brand", "")
+    config = _cfg()
+    if key not in list_brands(config):
+        raise HTTPException(404, f"Unknown brand '{key}'")
+    set_active(key)
+    # Switching brand means different feeds/voice — clear story/plan context.
+    _session["stories"]     = []
+    _session["plan"]        = None
+    _session["image_paths"] = {}
+    b = resolve_brand(config)
+    return {
+        "ok":     True,
+        "active": active_key(config),
+        "name":   b.get("name", ""),
+        "logo":   "/" + b.get("logo_path", "static/logo.png"),
+        "shape":  b.get("logo_shape", "round"),
+        "accent": b.get("theme", {}).get("accent", "#00B4C8"),
+    }
+
+
+# ── API: library (save/load generated content) ──────────────────────────────────
+LIB_PLANS   = Path("library/plans")
+LIB_STORIES = Path("library/stories")
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:40] or "item"
+
+
+def _active_brand_key() -> str:
+    from brands import active_key
+    return active_key(_cfg()) or ""
+
+
+def _apply_brand(key: str | None) -> None:
+    """Make the UI-selected brand authoritative for this action (and onward
+    renders), so the dropdown can never desync from what the server uses."""
+    from brands import set_active, list_brands
+    if key and key in list_brands(_cfg()):
+        set_active(key)
+
+
+def _lib_list(folder: Path) -> list[dict]:
+    items = []
+    for f in sorted(folder.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            meta = json.loads(f.read_text(encoding="utf-8")).get("meta", {})
+        except Exception:
+            meta = {}
+        items.append({"id": f.stem, **meta})
+    return items
+
+
+@app.post("/api/library/plan")
+async def api_lib_save_plan(body: dict = Body(default={})):
+    plan = body.get("plan") or _session.get("plan")
+    if not plan:
+        raise HTTPException(400, "No plan to save.")
+    name = body.get("name") or plan.get("title_card", {}).get("headline") \
+        or plan.get("headline") or plan.get("slug", "plan")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fid   = f"{_slug(name)}-{stamp}"
+    meta  = {"name": name, "brand": _active_brand_key(),
+             "slug": plan.get("slug", ""), "format": plan.get("format", "carousel"),
+             "when": datetime.now().isoformat(timespec="seconds")}
+    (LIB_PLANS / f"{fid}.json").write_text(
+        json.dumps({"meta": meta, "plan": plan}, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "id": fid, "meta": meta}
+
+
+@app.get("/api/library/plans")
+async def api_lib_plans():
+    return {"plans": _lib_list(LIB_PLANS)}
+
+
+@app.get("/api/library/plan/{fid}")
+async def api_lib_get_plan(fid: str):
+    f = LIB_PLANS / f"{_slug_id(fid)}.json"
+    if not f.exists():
+        raise HTTPException(404, fid)
+    data = json.loads(f.read_text(encoding="utf-8"))
+    _session["plan"]        = data.get("plan")
+    _session["image_paths"] = {}
+    return data
+
+
+@app.delete("/api/library/plan/{fid}")
+async def api_lib_del_plan(fid: str):
+    f = LIB_PLANS / f"{_slug_id(fid)}.json"
+    f.unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.post("/api/library/stories")
+async def api_lib_save_stories(body: dict = Body(default={})):
+    stories = _session.get("stories") or []
+    if not stories:
+        raise HTTPException(400, "No fetched stories to save.")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    bkey  = _active_brand_key()
+    name  = body.get("name") or f"{bkey or 'stories'} · {len(stories)} stories"
+    fid   = f"{_slug(bkey)}-{stamp}"
+    meta  = {"name": name, "brand": bkey, "count": len(stories),
+             "when": datetime.now().isoformat(timespec="seconds")}
+    (LIB_STORIES / f"{fid}.json").write_text(
+        json.dumps({"meta": meta, "stories": stories}, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "id": fid, "meta": meta}
+
+
+@app.get("/api/library/stories")
+async def api_lib_stories():
+    return {"stories": _lib_list(LIB_STORIES)}
+
+
+@app.get("/api/library/stories/{fid}")
+async def api_lib_get_stories(fid: str):
+    f = LIB_STORIES / f"{_slug_id(fid)}.json"
+    if not f.exists():
+        raise HTTPException(404, fid)
+    data = json.loads(f.read_text(encoding="utf-8"))
+    _session["stories"] = data.get("stories", [])
+    return data
+
+
+@app.delete("/api/library/stories/{fid}")
+async def api_lib_del_stories(fid: str):
+    (LIB_STORIES / f"{_slug_id(fid)}.json").unlink(missing_ok=True)
+    return {"ok": True}
+
+
+def _slug_id(fid: str) -> str:
+    """Sanitise a library id from the URL to a safe filename stem."""
+    return re.sub(r"[^A-Za-z0-9._-]", "", fid)
 
 
 # ── API: stories ──────────────────────────────────────────────────────────────
@@ -247,15 +501,22 @@ async def api_fetch_stories(
     top:      int = 5,
     category: str = "",
     model:    str = "",
+    brand:    str = "",
 ):
+    _apply_brand(brand)
+    _acquire("fetch stories")
     t0 = time.time()
     try:
         ranked = await _run(_sync_fetch_stories, limit, top, category or None, model or None)
         _session["stories"] = ranked
         elapsed = round(time.time() - t0, 1)
         return {"stories": ranked, "elapsed": elapsed}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(400, str(e))
+    finally:
+        _release()
 
 
 # ── API: plan ─────────────────────────────────────────────────────────────────
@@ -264,6 +525,8 @@ async def api_generate_plan(body: dict = Body(...)):
     story       = body.get("story", {})
     total       = body.get("total_slides") or None
     model       = body.get("model") or None
+    _apply_brand(body.get("brand"))
+    _acquire("generate plan")
     t0 = time.time()
     try:
         plan = await _run(_sync_generate_plan, story, total, model)
@@ -271,8 +534,12 @@ async def api_generate_plan(body: dict = Body(...)):
         _session["image_paths"] = {}
         elapsed = round(time.time() - t0, 1)
         return {"plan": plan, "elapsed": elapsed}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
+    finally:
+        _release()
 
 
 @app.get("/api/plan")
@@ -280,6 +547,38 @@ async def api_get_plan():
     if not _session["plan"]:
         raise HTTPException(404, "No plan loaded.")
     return {"plan": _session["plan"]}
+
+
+@app.post("/api/plan/caption")
+async def api_regen_caption(body: dict = Body(default={})):
+    plan = _session.get("plan")
+    if not plan:
+        raise HTTPException(400, "No plan loaded.")
+    _apply_brand(body.get("brand"))
+    _acquire("caption")
+    try:
+        out = await _run(_sync_regen_caption, plan, body.get("tone", ""))
+        plan["caption"]  = out.get("caption", plan.get("caption", ""))
+        plan["hashtags"] = out.get("hashtags", plan.get("hashtags", []))
+        return out
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        _release()
+
+
+@app.get("/api/session")
+async def api_get_session():
+    """Snapshot of server-side state so the UI can restore after a refresh."""
+    busy = _busy["job"] if (_busy["job"] and (time.time() - _busy["since"]) < _BUSY_TIMEOUT) else None
+    return {
+        "plan":        _session.get("plan"),
+        "stories":     _session.get("stories", []),
+        "image_paths": _session.get("image_paths", {}),
+        "busy":        busy,
+    }
 
 
 @app.post("/api/plan/dummy")
@@ -356,9 +655,31 @@ async def api_list_cache():
     return {"files": [{"name": f.name, "url": f"/image_cache/{f.name}"} for f in files]}
 
 
+@app.post("/api/images/cache/clear")
+async def api_clear_cache():
+    """Delete every cached background image and forget the session's image refs.
+
+    Two-segment path (.../cache/clear) so it can't collide with the single-segment
+    DELETE /api/images/{slide_idx} route.
+    """
+    cache = Path("image_cache")
+    removed, freed = 0, 0
+    for f in cache.glob("*"):
+        if f.is_file():
+            try:
+                freed += f.stat().st_size
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    _session["image_paths"] = {}
+    return {"ok": True, "removed": removed, "freed_mb": round(freed / 1_000_000, 2)}
+
+
 # ── API: preview ──────────────────────────────────────────────────────────────
 @app.get("/api/preview/{slide_idx}")
-async def api_preview(slide_idx: int):
+async def api_preview(slide_idx: int, brand: str = ""):
+    _apply_brand(brand)
     plan = _session.get("plan") or _dummy_plan()
     template, variables = _slide_vars(plan, slide_idx)
     try:
@@ -370,10 +691,11 @@ async def api_preview(slide_idx: int):
 
 # ── API: render ───────────────────────────────────────────────────────────────
 @app.post("/api/render")
-async def api_render():
+async def api_render(body: dict = Body(default={})):
     plan = _session.get("plan")
     if not plan:
         raise HTTPException(400, "No plan loaded.")
+    _apply_brand(body.get("brand"))
     t0 = time.time()
     try:
         out_dir = await _run(_sync_render_carousel, plan, _session.get("image_paths", {}))
@@ -418,11 +740,15 @@ async def api_save_template(filename: str, body: dict = Body(...)):
 @app.post("/api/template/preview/{filename}")
 async def api_template_preview(filename: str, body: dict = Body(default={})):
     plan = _session.get("plan") or _dummy_plan()
-    idx_map = {"title.html": 0, "brand.css": 0,
-               "content.html": 1,
-               "outro.html": 1 + len(plan.get("content_slides", []))}
-    idx = idx_map.get(filename, 0)
-    template, variables = _slide_vars(plan, idx)
+    if filename == "cover.html":
+        template  = "cover.html"
+        variables = {**_base_vars(plan), "category": body.get("category", "")}
+    else:
+        idx_map = {"title.html": 0, "brand.css": 0,
+                   "content.html": 1,
+                   "outro.html": 1 + len(plan.get("content_slides", []))}
+        idx = idx_map.get(filename, 0)
+        template, variables = _slide_vars(plan, idx)
     try:
         png = await _run(_sync_preview_slide, template, variables)
         return Response(content=png, media_type="image/png")
@@ -452,7 +778,12 @@ def _dummy_plan():
 # ── Frontend ──────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return HTMLResponse(FRONTEND_HTML)
+    # Never cache the UI — otherwise the browser can serve a stale build (e.g.
+    # an old brand switcher) and quietly use the wrong brand.
+    return HTMLResponse(FRONTEND_HTML, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+    })
 
 
 FRONTEND_HTML = r"""<!DOCTYPE html>
@@ -467,6 +798,9 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/htmlmixed/htmlmixed.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
 <style>
+@font-face{font-family:'Roboto Mono';font-weight:400;font-display:swap;src:url('/static/fonts/RobotoMono-400.woff2') format('woff2');}
+@font-face{font-family:'Roboto Mono';font-weight:500;font-display:swap;src:url('/static/fonts/RobotoMono-500.woff2') format('woff2');}
+@font-face{font-family:'Roboto Mono';font-weight:700;font-display:swap;src:url('/static/fonts/RobotoMono-700.woff2') format('woff2');}
 :root{--navy:#0A0F1E;--teal:#00B4C8;--green:#00C896;--panel:#111827;--border:#1e2a3a;--text:#e4e8f0;--muted:#6b7a96;--red:#e05252;--yellow:#f5c542;}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:Calibri,Arial,sans-serif;background:var(--navy);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden;font-size:15px;}
@@ -597,8 +931,8 @@ nav{display:flex;gap:3px;margin-left:16px;}
 <body>
 <header>
   <div class="logo">
-    <img src="/static/logo.png" alt="K2">
-    <span class="logo-text">K2<span> Digital Media</span></span>
+    <img id="hdr-logo" src="/static/logo.png" alt="brand">
+    <span class="logo-text" id="hdr-brand">K2<span> Digital Media</span></span>
   </div>
   <nav>
     <button class="nav-btn active" onclick="showTab('stories',this)">Stories</button>
@@ -608,6 +942,11 @@ nav{display:flex;gap:3px;margin-left:16px;}
   </nav>
   <div class="header-right">
     <span class="timer" id="hdr-timer"></span>
+    <button class="model-sel" id="notif-btn" onclick="toggleNotify()" title="Get a desktop notification when a task finishes" style="cursor:pointer;">🔔 Off</button>
+    <label style="font-size:11px;color:var(--muted);">Brand:</label>
+    <select class="model-sel" id="brand-sel" onchange="switchBrand(this.value)" title="Active brand / IG page">
+      <option>…</option>
+    </select>
     <label style="font-size:11px;color:var(--muted);">Model:</label>
     <select class="model-sel" id="model-sel" onchange="setModel(this.value)">
       <option>Loading…</option>
@@ -621,6 +960,7 @@ nav{display:flex;gap:3px;margin-left:16px;}
 <div id="tab-stories" class="tab active">
   <div class="stories-toolbar">
     <button class="btn btn-primary" onclick="fetchStories()" id="btn-fetch">Fetch &amp; Score</button>
+    <button class="btn btn-danger btn-sm" id="btn-cancel" style="display:none;" onclick="cancelJob()">⨯ Cancel</button>
     <div class="cat-tabs" id="cat-tabs">
       <button class="cat-btn active" onclick="selectCat('',this)">All</button>
     </div>
@@ -628,6 +968,8 @@ nav{display:flex;gap:3px;margin-left:16px;}
     <span style="font-size:11px;color:var(--muted);">fetch</span>
     <input type="number" id="fetch-top" value="6" min="1" max="15" style="width:44px;background:#0d1828;border:1px solid var(--border);border-radius:5px;color:#fff;padding:4px 6px;font-size:12px;" title="top N">
     <span style="font-size:11px;color:var(--muted);">top</span>
+    <button class="btn btn-ghost btn-sm" onclick="saveStorySet()" title="Save this fetched + scored set">💾 Save set</button>
+    <button class="btn btn-ghost btn-sm" onclick="openStoryLibrary()" title="Load a saved set (no re-fetch)">📂 Saved</button>
     <span id="stories-status"></span>
   </div>
 
@@ -642,6 +984,7 @@ nav{display:flex;gap:3px;margin-left:16px;}
     <div id="bulk-fmt-chips" style="display:flex;gap:4px;"></div>
     <select id="batch-src" class="src-sel"><option value="pexels">Pexels</option><option value="unsplash">Unsplash</option></select>
     <button class="btn btn-green" onclick="runBatch()" id="btn-batch">Generate All Selected</button>
+    <button class="btn btn-danger btn-sm" id="btn-cancel-batch" style="display:none;" onclick="cancelJob()">⨯ Cancel</button>
   </div>
 
   <div class="stories-list" id="stories-list">
@@ -657,6 +1000,8 @@ nav{display:flex;gap:3px;margin-left:16px;}
   <div class="editor-left">
     <div class="panel-header">
       <h3>Plan Editor</h3>
+      <button class="btn btn-ghost btn-sm" onclick="savePlan()" title="Save this plan to your library">💾 Save</button>
+      <button class="btn btn-ghost btn-sm" onclick="openLibrary()" title="Load a saved plan">📂 Library</button>
       <select id="slide-count-sel" style="background:#0d1828;border:1px solid var(--border);border-radius:5px;color:#fff;padding:3px 6px;font-size:12px;font-family:inherit;">
         <option value="3">3 slides</option>
         <option value="4" selected>4 slides</option>
@@ -691,6 +1036,7 @@ nav{display:flex;gap:3px;margin-left:16px;}
         <option value="unsplash">Unsplash</option>
       </select>
       <button class="btn btn-ghost btn-sm" onclick="fetchImages()" id="btn-fetch-img">Fetch Images</button>
+      <button class="btn btn-danger btn-sm" onclick="clearImageCache()" title="Delete all cached background images">🗑 Cache</button>
       <button class="btn btn-green" onclick="renderFull()" id="btn-render">Render Carousel</button>
     </div>
     <div class="preview-pane">
@@ -718,6 +1064,7 @@ nav{display:flex;gap:3px;margin-left:16px;}
         <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="applyPreset('title')">Title Card</button>
         <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="applyPreset('content')">Content Slide</button>
         <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="applyPreset('outro')">Outro / CTA</button>
+        <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="applyPreset('cover')">Brand Cover</button>
       </div>
     </div>
     <div>
@@ -843,6 +1190,18 @@ nav{display:flex;gap:3px;margin-left:16px;}
 </div>
 
 </div><!-- .main -->
+
+<!-- Library / picker modal -->
+<div id="modal-bg" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9998;align-items:center;justify-content:center;" onclick="if(event.target===this)closeModal()">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:12px;width:560px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;">
+    <div style="display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);">
+      <h3 id="modal-title" style="font-size:15px;color:#fff;flex:1;">Library</h3>
+      <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+    </div>
+    <div id="modal-body" style="padding:12px 14px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;"></div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -859,13 +1218,136 @@ let S = {
   formats: {},            // {key: name} from /api/formats
   selected: {},           // {storyIdx: {checked:bool, formats:Set}}
   bulkFormats: new Set(['carousel']),
+  busy: null,             // name of in-flight model job, or null
+  batch: [],              // last batch results (for Edit buttons)
+  brandInfo: null,        // active brand {name,short,handle,tagline,logo,accent,navy,...}
+  notify: false,          // desktop notifications enabled
+  cancelRequested: false, // user asked to cancel the running loop job
 };
+
+// Ask the server to stop the running fetch/batch after the current item.
+async function cancelJob() {
+  S.cancelRequested = true;
+  try {
+    const d = await api('/api/cancel','POST');
+    toast(d.ok ? 'Cancelling — stopping after the current item…' : 'Nothing to cancel');
+  } catch(e){ toast(e.message,'err'); }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Init
 // ═══════════════════════════════════════════════════════════════════════════
 window.addEventListener('DOMContentLoaded', async () => {
+  initNotify();
+  await loadBrands();
   await Promise.all([loadModels(), loadCategories(), loadFormats()]);
+  await restoreSession();
+});
+
+// ── Desktop notifications ────────────────────────────────────────────────────
+function initNotify() {
+  S.notify = localStorage.getItem('k2_notify')==='1'
+             && ('Notification' in window) && Notification.permission==='granted';
+  updateNotifBtn();
+}
+function updateNotifBtn() {
+  const b = g('notif-btn'); if(!b) return;
+  b.textContent = S.notify ? '🔔 On' : '🔔 Off';
+  b.style.color = S.notify ? 'var(--green)' : '';
+}
+async function toggleNotify() {
+  if(!('Notification' in window)) { toast('This browser has no notifications','err'); return; }
+  if(S.notify) { S.notify=false; localStorage.setItem('k2_notify','0'); updateNotifBtn(); toast('Notifications off'); return; }
+  let perm = Notification.permission;
+  if(perm!=='granted') perm = await Notification.requestPermission();
+  if(perm==='granted') {
+    S.notify=true; localStorage.setItem('k2_notify','1'); updateNotifBtn();
+    notify('Notifications enabled', "You'll be pinged when each task finishes.");
+  } else { toast('Notification permission denied — enable it in your browser site settings','err'); }
+}
+function notify(title, body) {
+  try {
+    if(S.notify && ('Notification' in window) && Notification.permission==='granted') {
+      const icon = (S.brandInfo && S.brandInfo.logo) || '/static/logo.png';
+      const n = new Notification(title, { body: body||'', icon, tag:'k2-task' });
+      setTimeout(()=>{ try{ n.close(); }catch(e){} }, 6000);
+    }
+  } catch(e){}
+}
+
+// ── Brands ──────────────────────────────────────────────────────────────────
+async function loadBrands() {
+  const sel = document.getElementById('brand-sel');
+  const data = await api('/api/brands').catch(() => ({ brands: {}, active: '' }));
+  const entries = Object.entries(data.brands || {});
+  if (!entries.length) { sel.innerHTML = '<option>—</option>'; return; }
+  sel.innerHTML = entries.map(([k, name]) =>
+    `<option value="${k}" ${k === data.active ? 'selected' : ''}>${esc(name)}</option>`).join('');
+  applyBrandChrome(await api('/api/brand').catch(() => null));
+}
+
+function applyBrandChrome(b) {
+  if (!b) return;
+  S.brandInfo = b;
+  const img = document.getElementById('hdr-logo');
+  if (img) {
+    img.src = b.logo + '?t=' + Date.now();
+    if (b.shape === 'wide') {   // full wordmark — show it whole, don't crop to a circle
+      img.style.cssText = 'height:30px;width:auto;max-width:120px;border-radius:0;object-fit:contain;';
+    } else {
+      img.style.cssText = 'width:34px;height:34px;border-radius:50%;object-fit:cover;';
+    }
+  }
+  const txt = document.getElementById('hdr-brand');
+  if (txt) txt.textContent = b.name || '';
+  if (b.accent) document.documentElement.style.setProperty('--teal', b.accent);
+}
+
+async function switchBrand(key) {
+  if (S.busy) { toast(`Wait — '${S.busy}' is still running`, 'err'); return; }
+  try {
+    const b = await api('/api/brand', 'PUT', { brand: key });
+    applyBrandChrome(b);
+    // brand switch clears server context; reset the UI too
+    S.plan = null; S.stories = []; S.imagePaths = {}; S.batch = [];
+    document.getElementById('stories-list').innerHTML =
+      `<div style="color:var(--muted);text-align:center;padding:40px;font-size:13px;">
+         Switched to <b>${esc(b.name)}</b>. Click <b>Fetch &amp; Score</b> to pull its feeds.</div>`;
+    document.getElementById('batch-bar').style.display = 'none';
+    document.getElementById('plan-form').innerHTML =
+      `<div style="color:var(--muted);text-align:center;padding:28px 10px;font-size:12px;">
+         Pick a story → plan loads here.</div>`;
+    await Promise.all([loadCategories(true), loadFormats()]);
+    toast(`Brand: ${b.name}`);
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+// Re-hydrate from server state so a refresh / back-navigation doesn't wipe your
+// work (which previously forced you to regenerate, re-running the model).
+async function restoreSession() {
+  let s;
+  try { s = await api('/api/session'); } catch(e) { return; }
+  if (s.stories && s.stories.length) {
+    S.stories = s.stories;
+    renderStoriesList(s.stories);
+  }
+  if (s.plan) {
+    loadPlan(s.plan);
+    S.imagePaths = s.image_paths || {};
+    Object.entries(S.imagePaths).forEach(([i,p]) => {
+      if (p) setThumb(parseInt(i), '/image_cache/' + p.split(/[/\\]/).pop());
+    });
+    toast('Restored your last plan');
+  }
+  if (s.busy) {
+    S.busy = s.busy;
+    toast(`A '${s.busy}' job is still running on the server…`, 'err');
+  }
+}
+
+// Warn before leaving while a model job is in flight.
+window.addEventListener('beforeunload', (e) => {
+  if (S.busy) { e.preventDefault(); e.returnValue = ''; }
 });
 
 async function loadFormats() {
@@ -902,6 +1384,8 @@ async function loadCategories() {
   const data = await api('/api/categories').catch(() => ({ categories: {} }));
   const cats = data.categories || {};
   const tb = document.getElementById('cat-tabs');
+  S.selectedCat = '';
+  tb.innerHTML = '<button class="cat-btn active" onclick="selectCat(\'\',this)">All</button>';
   Object.entries(cats).forEach(([k, name]) => {
     const b = document.createElement('button');
     b.className = 'cat-btn';
@@ -941,21 +1425,28 @@ async function fetchStories() {
   const top   = document.getElementById('fetch-top').value;
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Fetching…';
   status.innerHTML = '<span class="badge badge-info">Scoring with Ollama…</span>';
+  S.busy = 'fetch stories'; S.cancelRequested = false;
+  const cancelBtn = g('btn-cancel'); if(cancelBtn) cancelBtn.style.display='inline-flex';
   const t0 = Date.now();
   const tid = setInterval(() => {
     document.getElementById('hdr-timer').textContent = ((Date.now()-t0)/1000).toFixed(1)+'s';
   }, 200);
   try {
-    const data = await api(`/api/stories/fetch?limit=${limit}&top=${top}&category=${S.selectedCat}&model=${encodeURIComponent(model)}`, 'POST');
+    const data = await api(`/api/stories/fetch?limit=${limit}&top=${top}&category=${S.selectedCat}&model=${encodeURIComponent(model)}&brand=${encodeURIComponent(curBrand())}`, 'POST');
     S.stories = data.stories;
     renderStoriesList(data.stories);
-    status.innerHTML = `<span class="badge badge-ok">${data.stories.length} ranked · ${data.elapsed}s</span>`;
+    const cancelNote = S.cancelRequested ? ' · cancelled' : '';
+    status.innerHTML = `<span class="badge badge-ok">${data.stories.length} ranked · ${data.elapsed}s${cancelNote}</span>`;
     document.getElementById('hdr-timer').textContent = data.elapsed+'s';
+    notify(S.cancelRequested ? 'Fetch cancelled' : 'Fetch & Score complete',
+           `${data.stories.length} ${curBrand()||''} stories ranked in ${data.elapsed}s`);
   } catch(e) {
     status.innerHTML = `<span class="badge badge-err">${e.message}</span>`;
     toast(e.message, 'err');
   } finally {
+    S.busy = null;
     clearInterval(tid);
+    if(cancelBtn) cancelBtn.style.display='none';
     btn.disabled = false; btn.innerHTML = 'Fetch &amp; Score';
   }
 }
@@ -1030,26 +1521,34 @@ async function runBatch() {
   const totalPosts = items.reduce((a,it)=>a+it.formats.length,0);
   const btn = document.getElementById('btn-batch');
   btn.disabled = true; btn.innerHTML = `<span class="spin"></span> Generating ${totalPosts}…`;
+  S.busy = 'batch'; S.cancelRequested = false;
+  const cancelBtn = g('btn-cancel-batch'); if(cancelBtn) cancelBtn.style.display='inline-flex';
   const t0 = Date.now();
   const tid = setInterval(()=>{ document.getElementById('hdr-timer').textContent = ((Date.now()-t0)/1000).toFixed(1)+'s'; },200);
   try {
     const model = document.getElementById('model-sel').value;
     const source = document.getElementById('batch-src').value;
-    const data = await api('/api/batch/run','POST',{items,model,source});
-    clearInterval(tid);
+    const data = await api('/api/batch/run','POST',{items,model,source,brand:curBrand()});
     document.getElementById('hdr-timer').textContent = data.elapsed+'s';
     showBatchResults(data);
     const ok = data.results.filter(r=>r.ok).length;
-    toast(`Batch done: ${ok}/${data.results.length} posts in ${data.elapsed}s`);
+    const note = data.cancelled ? ' (cancelled)' : '';
+    toast(`Batch done${note}: ${ok}/${data.results.length} posts in ${data.elapsed}s`);
+    notify(data.cancelled ? 'Batch cancelled' : 'Batch complete',
+           `${ok}/${data.results.length} posts rendered in ${data.elapsed}s`);
   } catch(e) {
-    clearInterval(tid);
     toast(e.message,'err');
+    notify('Batch failed', e.message);
   } finally {
+    S.busy = null;
+    clearInterval(tid);
+    if(cancelBtn) cancelBtn.style.display='none';
     btn.disabled = false; btn.innerHTML = 'Generate All Selected';
   }
 }
 
 function showBatchResults(data) {
+  S.batch = data.results || [];
   const list = document.getElementById('stories-list');
   list.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
@@ -1060,7 +1559,7 @@ function showBatchResults(data) {
       <div style="flex:1"></div>
       <button class="btn btn-ghost btn-sm" onclick="renderStoriesList(S.stories)">← Back to stories</button>
     </div>
-    ${data.results.map(r => r.ok ? `
+    ${data.results.map((r,ri) => r.ok ? `
       <div class="story-card">
         <div class="s-top">
           <span class="score-pill badge badge-info">${esc(S.formats[r.format]||r.format)}</span>
@@ -1070,12 +1569,53 @@ function showBatchResults(data) {
           ${r.files.map(f=>`<a href="/outputs/${r.rel}/${f}" target="_blank"><img src="/outputs/${r.rel}/${f}" style="height:120px;border-radius:5px;border:1px solid var(--border);"></a>`).join('')}
         </div>
         <div class="story-reason" style="white-space:pre-wrap;">${esc(r.caption)}</div>
+        <div class="story-actions" style="margin-top:8px;">
+          ${r.format==='carousel'
+            ? `<button class="btn btn-primary btn-sm" onclick="editBatchPlan(${ri})">✎ Edit in Editor</button>`
+            : `<span style="font-size:11px;color:var(--muted);">single-card format — edit in the Canvas/Templates tab</span>`}
+          <a href="/outputs/${r.rel}/" target="_blank" class="btn btn-ghost btn-sm">Open folder ↗</a>
+        </div>
       </div>` : `
       <div class="story-card" style="border-color:var(--red);">
         <div class="s-top"><span class="score-pill badge badge-err">${esc(r.format)} failed</span><span class="story-title">${esc(r.title)}</span></div>
         <div class="story-reason" style="color:var(--red);">${esc(r.error||'')}</div>
+        <div class="story-actions" style="margin-top:8px;">
+          <button class="btn btn-ghost btn-sm" onclick="retryBatchItem(${ri})">↻ Retry this one</button>
+        </div>
       </div>`).join('')}
   `;
+}
+
+// Load a finished batch result's plan into the Editor for tweaking + re-render.
+function editBatchPlan(ri) {
+  const r = S.batch[ri];
+  if (!r || !r.plan) { toast('No editable plan for this result', 'err'); return; }
+  loadPlan(r.plan);
+  S.imagePaths = {};
+  api('/api/plan', 'PUT', r.plan).catch(()=>{});   // sync server session for preview/render
+  showTab('editor', document.querySelectorAll('.nav-btn')[1]);
+  toast('Loaded into editor — tweak then Render');
+}
+
+// Re-run a single failed batch item (most failures are flaky model JSON).
+async function retryBatchItem(ri) {
+  const r = S.batch[ri];
+  if (!r || !r.story) { toast('Cannot retry this item', 'err'); return; }
+  if (S.busy) { toast(`Wait — '${S.busy}' is still running`, 'err'); return; }
+  S.busy = 'batch';
+  toast(`Retrying ${r.format}…`);
+  try {
+    const model  = document.getElementById('model-sel').value;
+    const source = document.getElementById('batch-src').value;
+    const total  = parseInt(document.getElementById('slide-count-sel')?.value || '4');
+    const data = await api('/api/batch/run','POST',{
+      items:[{story:r.story, formats:[r.format], total_slides:total}], model, source, brand:curBrand(),
+    });
+    const nr = (data.results||[])[0];
+    if (nr) { S.batch[ri] = nr; showBatchResults({results:S.batch, batch_dir:data.batch_dir}); }
+    toast(nr && nr.ok ? `${r.format} succeeded` : `${r.format} failed again`, nr && nr.ok ? 'ok':'err');
+  } catch(e) { toast(e.message,'err'); }
+  finally { S.busy = null; }
 }
 
 async function useStor(i) {
@@ -1085,6 +1625,7 @@ async function useStor(i) {
   const model  = document.getElementById('model-sel').value;
   const total  = parseInt(document.getElementById('slide-count-sel').value);
   toast('Generating plan…');
+  S.busy = 'generate plan';
   const t0 = Date.now();
   const tid = setInterval(() => {
     document.getElementById('hdr-timer').textContent = ((Date.now()-t0)/1000).toFixed(1)+'s';
@@ -1094,15 +1635,18 @@ async function useStor(i) {
       story: {title:s.title,summary:s.summary,url:s.url,published:s.published||''},
       total_slides: total,
       model,
+      brand: curBrand(),
     });
-    clearInterval(tid);
     document.getElementById('hdr-timer').textContent = data.elapsed+'s';
     loadPlan(data.plan);
     showTab('editor', document.querySelectorAll('.nav-btn')[1]);
     toast(`Plan ready (${data.elapsed}s)`);
+    notify('Plan ready', `${(data.plan.title_card&&data.plan.title_card.headline)||s.title.slice(0,60)} · ${data.elapsed}s`);
   } catch(e) {
-    clearInterval(tid);
     toast(e.message,'err');
+  } finally {
+    S.busy = null;
+    clearInterval(tid);
   }
 }
 
@@ -1151,10 +1695,76 @@ function renderForm(plan) {
       <div class="field-group"><label>CTA Text</label><input id="f-cta" value="${esc(plan.outro_card?.cta||'')}" oninput="syncPlan()"></div>
       <div class="field-group"><label>Handle</label><input id="f-hdl" value="${esc(plan.outro_card?.handle||'')}" oninput="syncPlan()"></div>
     </div>
-    <div class="field-group"><label>Caption</label><textarea id="f-cap" rows="3" oninput="syncPlan()">${esc(plan.caption||'')}</textarea></div>
-    <div class="field-group"><label>Hashtags (comma-separated)</label><input id="f-tags" value="${esc((plan.hashtags||[]).join(', '))}" oninput="syncPlan()"></div>
-    <div class="field-group"><label>DM Keyword</label><input id="f-dm" value="${esc(plan.dm_keyword||'')}" oninput="syncPlan()"></div>
+
+    <div class="slide-sec">
+      <div class="slide-sec-title">Layout & Brand Furniture</div>
+      <div class="field-group"><label>Bottom "brand badge" position</label>
+        <select id="f-badge" onchange="syncLayout()">
+          <option value="center">Center</option>
+          <option value="left">Bottom-left</option>
+          <option value="right">Bottom-right</option>
+        </select>
+      </div>
+      <div class="field-group"><label>Background logo position</label>
+        <select id="f-wmpos" onchange="syncLayout()">
+          <option value="center">Center</option>
+          <option value="top">Top</option>
+          <option value="bottom">Bottom</option>
+          <option value="left">Left</option>
+          <option value="right">Right</option>
+          <option value="top-left">Top-left</option>
+          <option value="top-right">Top-right</option>
+          <option value="bottom-left">Bottom-left</option>
+          <option value="bottom-right">Bottom-right</option>
+        </select>
+      </div>
+      <div class="field-group"><label>Background logo visibility: <span id="wmop-val">5</span>%</label>
+        <input type="range" id="f-wmop" min="0" max="20" value="5" oninput="document.getElementById('wmop-val').textContent=this.value;syncLayout()">
+      </div>
+    </div>
+
+    <div class="slide-sec">
+      <div class="slide-sec-title">Caption & Hashtags</div>
+      <div class="field-group"><label>Caption</label><textarea id="f-cap" rows="3" oninput="syncPlan()">${esc(plan.caption||'')}</textarea></div>
+      <div class="field-group"><label>Hashtags (comma-separated)</label><input id="f-tags" value="${esc((plan.hashtags||[]).join(', '))}" oninput="syncPlan()"></div>
+      <div class="field-group"><label>DM Keyword</label><input id="f-dm" value="${esc(plan.dm_keyword||'')}" oninput="syncPlan()"></div>
+      <div class="field-group"><label>Tone / extra direction (optional)</label><input id="f-tone" value="${esc(plan.tone||'')}" placeholder="e.g. punchy, hype, formal…" oninput="syncPlan()"></div>
+      <button class="btn btn-ghost btn-sm" onclick="regenCaption()" id="btn-regen-cap" style="align-self:flex-start;">✨ Generate caption + hashtags</button>
+    </div>
   `;
+  // reflect saved layout into the controls
+  const L = plan.layout || {};
+  if (g('f-badge')) g('f-badge').value = L.badge_align || 'center';
+  if (g('f-wmpos')) g('f-wmpos').value = L.wm_pos || 'center';
+  if (g('f-wmop'))  { g('f-wmop').value = (L.wm_opacity ?? 5); g('wmop-val').textContent = (L.wm_opacity ?? 5); }
+}
+
+function syncLayout() {
+  if (!S.plan) return;
+  S.plan.layout = {
+    badge_align: g('f-badge')?.value || 'center',
+    wm_pos:      g('f-wmpos')?.value || 'center',
+    wm_opacity:  parseInt(g('f-wmop')?.value ?? '5'),
+  };
+  api('/api/plan','PUT',S.plan).catch(()=>{});
+  previewCurrent();   // live-reflect the layout change
+}
+
+async function regenCaption() {
+  if (!S.plan) { toast('Load a plan first','err'); return; }
+  syncPlan();
+  const btn = g('btn-regen-cap');
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Generating…';
+  try {
+    const data = await api('/api/plan/caption','POST',{tone:g('f-tone')?.value||'',brand:curBrand()});
+    S.plan.caption = data.caption; S.plan.hashtags = data.hashtags;
+    if (g('f-cap'))  g('f-cap').value  = data.caption || '';
+    if (g('f-tags')) g('f-tags').value = (data.hashtags||[]).join(', ');
+    api('/api/plan','PUT',S.plan).catch(()=>{});
+    toast('Caption + hashtags regenerated');
+    notify('Caption ready', 'New caption + hashtags generated');
+  } catch(e){ toast(e.message,'err'); }
+  finally { btn.disabled=false; btn.innerHTML='✨ Generate caption + hashtags'; }
 }
 
 function syncPlan() {
@@ -1176,6 +1786,7 @@ function syncPlan() {
   S.plan.caption    = g('f-cap')?.value||'';
   S.plan.hashtags   = (g('f-tags')?.value||'').split(',').map(h=>h.trim().replace(/^#/,'')).filter(Boolean);
   S.plan.dm_keyword = g('f-dm')?.value||'';
+  if (g('f-tone')) S.plan.tone = g('f-tone').value||'';
   api('/api/plan','PUT',S.plan).catch(()=>{});
 }
 
@@ -1202,7 +1813,7 @@ async function previewCurrent() {
   const wrap = g('preview-wrap');
   wrap.innerHTML='<div class="preview-placeholder"><span class="spin"></span> Rendering…</div>';
   try {
-    const blob = await fetch(`/api/preview/${S.slideIdx}`).then(r=>{if(!r.ok)throw new Error('render failed');return r.blob();});
+    const blob = await fetch(`/api/preview/${S.slideIdx}?brand=${encodeURIComponent(curBrand())}`).then(r=>{if(!r.ok)throw new Error('render failed');return r.blob();});
     const url  = URL.createObjectURL(blob);
     wrap.innerHTML = `<img src="${url}" alt="slide ${S.slideIdx}">`;
   } catch(e) {
@@ -1226,8 +1837,22 @@ async function fetchImages() {
       if(p) setThumb(parseInt(i),'/image_cache/'+p.split(/[/\\]/).pop());
     });
     toast(`Images fetched (${data.elapsed}s)`);
+    notify('Images fetched', `Background images ready in ${data.elapsed}s`);
   } catch(e) { toast(e.message,'err'); }
   finally { btn.disabled=false; btn.innerHTML='Fetch Images'; }
+}
+
+async function clearImageCache() {
+  if (!confirm('Delete ALL cached background images? (Plans are kept; you can re-fetch images.)')) return;
+  try {
+    const d = await api('/api/images/cache/clear','POST');
+    S.imagePaths = {};
+    // blank out any thumbnails still shown in the form
+    document.querySelectorAll('.img-thumb').forEach(el=>{
+      const id = el.id; if(id){ el.outerHTML = `<div class="img-thumb empty" id="${id}">🖼</div>`; }
+    });
+    toast(`Cleared ${d.removed} cached images (${d.freed_mb} MB freed)`);
+  } catch(e){ toast(e.message,'err'); }
 }
 
 async function swapImage(idx) {
@@ -1239,6 +1864,7 @@ async function swapImage(idx) {
     S.imagePaths[idx] = data.path;
     setThumb(idx,'/image_cache/'+data.filename);
     toast(`Slide ${idx+1} image updated`);
+    showSlidePreview(idx+1);
   } catch(e){toast(e.message,'err');}
 }
 
@@ -1250,7 +1876,17 @@ async function imgFromUrl(idx) {
     S.imagePaths[idx] = data.path;
     setThumb(idx,'/image_cache/'+data.filename);
     toast(`Slide ${idx+1} image set from URL`);
+    showSlidePreview(idx+1);
   } catch(e){toast(e.message,'err');}
+}
+
+// Jump the preview pane to a content slide and re-render it so image changes show
+// immediately (content slide N lives at overall index N).
+function showSlidePreview(slideIdx) {
+  if (slideIdx < 0 || slideIdx >= S.totalSlides) return;
+  S.slideIdx = slideIdx;
+  updateCnt();
+  previewCurrent();
 }
 
 function setThumb(idx,url) {
@@ -1265,10 +1901,11 @@ async function renderFull() {
   const t0=Date.now();
   const tid=setInterval(()=>{document.getElementById('hdr-timer').textContent=((Date.now()-t0)/1000).toFixed(1)+'s';},200);
   try {
-    const data = await api('/api/render','POST');
+    const data = await api('/api/render','POST',{brand:curBrand()});
     clearInterval(tid);
     document.getElementById('hdr-timer').textContent=data.elapsed+'s';
     toast(`✓ Rendered ${data.files.length} slides in ${data.elapsed}s`);
+    notify('Carousel rendered', `${data.files.length} slides saved in ${data.elapsed}s`);
     g('preview-wrap').innerHTML=`
       <div style="text-align:center;padding:16px;line-height:1.8;">
         <div style="font-size:16px;font-weight:700;color:var(--green);margin-bottom:6px;">Carousel saved!</div>
@@ -1280,6 +1917,7 @@ async function renderFull() {
   } catch(e){
     clearInterval(tid);
     toast(e.message,'err');
+    notify('Render failed', e.message);
   } finally {
     btn.disabled=false; btn.innerHTML='Render Carousel';
   }
@@ -1290,6 +1928,8 @@ async function renderFull() {
 // ═══════════════════════════════════════════════════════════════════════════
 const CW=540, CH=675;   // display size (50% of 1080x1350)
 let fc=null, overlayRect=null;
+
+const RMONO = "'Roboto Mono', monospace";
 
 function initCanvas() {
   window._fc = true;
@@ -1305,7 +1945,110 @@ function initCanvas() {
   fc.on('selection:updated', selectionChanged);
   fc.on('selection:cleared',  ()=>clearProps());
   fc.on('object:modified',    selectionChanged);
-  applyPreset('title');
+  // Make sure Roboto Mono is loaded before first paint so canvas == editor.
+  const draw = () => applyPreset('title');
+  if (document.fonts && document.fonts.load) {
+    Promise.all([
+      document.fonts.load("700 40px 'Roboto Mono'"),
+      document.fonts.load("400 20px 'Roboto Mono'"),
+    ]).then(draw).catch(draw);
+  } else { draw(); }
+}
+
+// Active brand info (with safe fallback) for canvas drawing.
+function _bi() {
+  return S.brandInfo || {
+    name:'K2 Digital Media', short:'K2', handle:'@k2digitalmedia_',
+    tagline:'The complete online presence for local business',
+    pitch:'One agency. Four services.', services:'Web · Video · Marketing · IT',
+    location:'London, Ontario', website:'k2digitalmedia.ca', category:'WEB DEVELOPMENT',
+    logo:'/static/logo.png', accent:'#00B4C8', accent2:'#00C896', navy:'#0A0F1E', text:'#FFFFFF',
+  };
+}
+function _mkText(text,o){ return new fabric.Text(text,Object.assign({fontFamily:RMONO,fill:'#fff',selectable:true},o)); }
+function _mkIText(text,o){ return new fabric.IText(text,Object.assign({fontFamily:RMONO,fill:'#fff',selectable:true,editable:true},o)); }
+
+function addWatermark() {
+  const bi=_bi();
+  fabric.Image.fromURL(bi.logo, img=>{
+    img.scaleToWidth(380);
+    img.set({left:CW/2, top:CH*0.55, originX:'center', originY:'center', opacity:0.06, selectable:false, evented:false});
+    fc.add(img); fc.sendToBack(img); fc.renderAll();
+  });
+}
+function addFrame() {
+  fc.add(new fabric.Rect({left:15, top:15, width:CW-30, height:CH-30, fill:'',
+    stroke:'rgba(255,255,255,0.12)', strokeWidth:1, rx:8, ry:8, selectable:false, evented:false}));
+}
+function addLockup(x,y) {
+  const bi=_bi();
+  fc.add(_mkText(bi.name, {left:x+38, top:y+1, fontSize:14, fontWeight:'700'}));
+  fc.add(_mkText(bi.tagline, {left:x+38, top:y+19, fontSize:8, fontWeight:'400', fontStyle:'italic', fill:'rgba(255,255,255,0.42)'}));
+  fabric.Image.fromURL(bi.logo, img=>{ img.scaleToWidth(30); img.set({left:x, top:y, selectable:true}); fc.add(img); fc.renderAll(); });
+}
+function addBadge(cy) {
+  const bi=_bi();
+  fabric.Image.fromURL(bi.logo, img=>{
+    img.scaleToWidth(23); img.set({left:0, top:0, originY:'center'});
+    const name=_mkText(bi.name, {left:30, top:0, originY:'center', fontSize:12.5, fontWeight:'700'});
+    const grp=new fabric.Group([img,name], {originX:'center', left:CW/2, top:cy, selectable:true});
+    fc.add(grp); fc.renderAll();
+  });
+}
+
+function applyPreset(type) {
+  if(!fc) return;
+  fc.clear();
+  const bi=_bi(), plan=S.plan;
+  fc.backgroundColor = bi.navy;
+
+  if(type==='title') {
+    const P=42;
+    addWatermark();
+    addLockup(P,P);
+    fc.add(_mkIText(plan?.title_card?.headline||'Your headline goes here', {left:P, top:248, fontSize:35, fontWeight:'700', fill:'#fff', width:CW-2*P}));
+    fc.add(new fabric.Rect({left:P, top:360, width:29, height:2, fill:bi.accent, selectable:true, strokeWidth:0}));
+    fc.add(_mkIText(plan?.title_card?.subhead||'Your subhead goes here.', {left:P, top:374, fontSize:13, fontWeight:'400', fill:'rgba(255,255,255,0.62)', width:CW-2*P}));
+    fc.add(_mkText(bi.handle, {left:CW/2, top:CH-46, originX:'center', fontSize:9, fontWeight:'400', fill:'rgba(255,255,255,0.45)'}));
+    addFrame();
+  } else if(type==='content') {
+    const P=38;
+    addWatermark();
+    const meta=[bi.handle].filter(Boolean).join(' · ');
+    fc.add(_mkText(meta?('· '+meta):'', {left:CW/2, top:P, originX:'center', fontSize:9, fontWeight:'400', fill:'rgba(255,255,255,0.45)'}));
+    fc.add(_mkText('01', {left:P, top:248, fontSize:10.5, fontWeight:'700', fill:bi.accent, charSpacing:200}));
+    fc.add(_mkIText('SLIDE HEADING', {left:P, top:270, fontSize:31, fontWeight:'700', fill:'#fff', width:CW-2*P}));
+    fc.add(_mkIText('— Key point one\n— Key point two', {left:P, top:330, fontSize:16, fontWeight:'400', fill:'rgba(255,255,255,0.88)', width:CW-2*P}));
+    addBadge(CH-44);
+    addFrame();
+  } else if(type==='outro') {
+    const P=38;
+    const grad=new fabric.Gradient({type:'linear', coords:{x1:0,y1:0,x2:CW,y2:CH},
+      colorStops:[{offset:0,color:bi.accent},{offset:0.62,color:bi.navy}]});
+    fc.setBackgroundColor(grad, fc.renderAll.bind(fc));
+    addWatermark();
+    fc.add(_mkText('· '+(bi.website||bi.handle||''), {left:CW/2, top:P, originX:'center', fontSize:9, fontWeight:'400', fill:'rgba(255,255,255,0.55)'}));
+    fc.add(_mkIText(plan?.outro_card?.cta||'Follow for updates', {left:P, top:250, fontSize:29, fontWeight:'700', fill:'#fff', width:CW-2*P}));
+    fc.add(_mkIText(plan?.outro_card?.handle||bi.handle, {left:P, top:330, fontSize:17, fontWeight:'500', fill:'rgba(255,255,255,0.9)', width:CW-2*P}));
+    addBadge(CH-44);
+    addFrame();
+  } else if(type==='cover') {
+    addWatermark();
+    fc.add(new fabric.Rect({left:42, top:46, width:9, height:9, fill:bi.accent, selectable:true}));
+    fc.add(_mkText((bi.category||'').toUpperCase(), {left:58, top:42, fontSize:13, fontWeight:'700', charSpacing:120}));
+    fc.add(_mkText(bi.handle, {left:CW-42, top:44, originX:'right', fontSize:11, fontWeight:'500', fill:'rgba(255,255,255,0.6)'}));
+    fc.add(_mkText(bi.short, {left:CW/2, top:CH*0.40, originX:'center', originY:'center', fontSize:120, fontWeight:'700'}));
+    if((bi.name||'').indexOf(' ')>=0)
+      fc.add(_mkText(bi.name.split(' ').slice(1).join(' ').toUpperCase(), {left:CW/2, top:CH*0.40+78, originX:'center', fontSize:28, fontWeight:'400', charSpacing:300, fill:'rgba(255,255,255,0.82)'}));
+    fc.add(new fabric.Rect({left:CW/2-52, top:CH*0.40+118, width:46, height:2, fill:bi.accent, selectable:true}));
+    fc.add(new fabric.Rect({left:CW/2+6,  top:CH*0.40+118, width:46, height:2, fill:bi.accent2||bi.accent, selectable:true}));
+    fc.add(_mkText(bi.pitch||'', {left:CW/2, top:CH*0.40+138, originX:'center', fontSize:15, fontWeight:'500', fontStyle:'italic', fill:'rgba(255,255,255,0.85)'}));
+    fc.add(_mkText(bi.services||'', {left:CW/2, top:CH*0.40+162, originX:'center', fontSize:12, fontWeight:'400', fill:'rgba(255,255,255,0.5)'}));
+    const loc=[bi.location,bi.website].filter(Boolean).join(' · ');
+    fc.add(_mkText(loc, {left:CW/2, top:CH-46, originX:'center', fontSize:10, fontWeight:'400', fill:'rgba(255,255,255,0.45)'}));
+    addFrame();
+  }
+  fc.renderAll();
 }
 
 function drawOverlay(pct) {
@@ -1323,45 +2066,6 @@ function drawOverlay(pct) {
 function updateOverlay(v) {
   document.getElementById('overlay-val').textContent = v+'%';
   drawOverlay(parseInt(v));
-}
-
-function applyPreset(type) {
-  if(!fc) return;
-  fc.clear();
-  fc.backgroundColor='#0A0F1E';
-
-  if(type==='title') {
-    fc.backgroundColor='#0A0F1E';
-    const plan = S.plan;
-    addLogoImg(30,30,48);
-    addStaticText('K2 Digital Media',80,42,22,'bold','#ffffff');
-    addStaticText('@k2digitalmedia_',CW-140,42,16,'bold','#00B4C8');
-    addEditableText(plan?.title_card?.headline||'Your Headline Here', 38, 240, 92, 'bold', '#ffffff', CW-80);
-    const rule=new fabric.Rect({left:38,top:490,width:58,height:3,fill:'#00B4C8',selectable:true,strokeWidth:0});
-    fc.add(rule);
-    addEditableText(plan?.title_card?.subhead||'Your subhead goes here.', 38, 510, 28, 'normal', 'rgba(255,255,255,0.72)', CW-80);
-  } else if(type==='content') {
-    fc.backgroundColor='#0A0F1E';
-    addStaticText('@k2digitalmedia_',CW-140,30,15,'normal','rgba(255,255,255,0.4)');
-    addStaticText('01',38,200,16,'bold','#00B4C8');
-    addEditableText('SLIDE HEADING', 38, 225, 58, 'bold', '#ffffff', CW-80, true);
-    addEditableText('— Key point one\n— Key point two\n— Key point three', 38, 310, 26, 'normal', 'rgba(255,255,255,0.9)', CW-80);
-    addLogoImg(CW-68, CH-52, 40);
-    addStaticText('K2 Digital Media',CW-158,CH-40,15,'bold','rgba(255,255,255,0.75)');
-  } else if(type==='outro') {
-    fc.backgroundColor='#0A0F1E';
-    // Teal gradient rectangle
-    const grad=new fabric.Gradient({type:'linear',coords:{x1:0,y1:0,x2:CW,y2:0},colorStops:[{offset:0,color:'#00B4C8'},{offset:1,color:'#0A0F1E'}]});
-    fc.setBackgroundColor(grad,fc.renderAll.bind(fc));
-    addStaticText('@k2digitalmedia_',CW-140,30,15,'normal','rgba(255,255,255,0.55)');
-    const plan = S.plan;
-    addEditableText(plan?.outro_card?.cta||'Follow for updates', 38, 220, 54, 'bold', '#ffffff', CW-76);
-    addEditableText(plan?.outro_card?.handle||'@k2digitalmedia_', 38, 340, 32, 'bold', 'rgba(255,255,255,0.9)', CW-76);
-    addLogoImg(30, CH-52, 40);
-    addStaticText('K2 Digital Media',78,CH-40,15,'bold','rgba(255,255,255,0.85)');
-    addStaticText('@k2digitalmedia_',CW-140,CH-40,16,'bold','rgba(255,255,255,0.65)');
-  }
-  fc.renderAll();
 }
 
 // Mirror the slide currently open in the Editor (real text + background image)
@@ -1399,25 +2103,23 @@ function loadSlideToCanvas() {
 }
 
 function addLogoImg(x,y,size) {
-  fabric.Image.fromURL('/static/logo.png', img=>{
+  fabric.Image.fromURL(_bi().logo, img=>{
     img.scaleToWidth(size);
-    img.scaleToHeight(size);
     img.set({left:x,top:y,selectable:true});
     fc.add(img);fc.renderAll();
   });
 }
 
 function addStaticText(text,x,y,size,weight,color) {
-  const t=new fabric.Text(text,{
-    left:x,top:y,fontSize:size,fontFamily:'Calibri,Arial,sans-serif',
+  fc.add(new fabric.Text(text,{
+    left:x,top:y,fontSize:size,fontFamily:RMONO,
     fill:color,fontWeight:weight,selectable:true
-  });
-  fc.add(t);
+  }));
 }
 
 function addEditableText(text,x,y,size,weight,color,maxW,upperCase=false) {
   const t=new fabric.IText(text,{
-    left:x,top:y,fontSize:size,fontFamily:'Calibri,Arial,sans-serif',
+    left:x,top:y,fontSize:size,fontFamily:RMONO,
     fill:color,fontWeight:weight,width:maxW||CW-80,
     selectable:true,editable:true,
   });
@@ -1428,7 +2130,7 @@ function addEditableText(text,x,y,size,weight,color,maxW,upperCase=false) {
 function addText(text,size,weight) {
   if(!fc) return;
   const t=new fabric.IText(text,{
-    left:60,top:100,fontSize:size/2,fontFamily:'Calibri,Arial,sans-serif',
+    left:60,top:100,fontSize:size/2,fontFamily:RMONO,
     fill:'#ffffff',fontWeight:weight,selectable:true,editable:true,
   });
   fc.add(t);fc.setActiveObject(t);fc.renderAll();
@@ -1629,9 +2331,105 @@ async function previewTemplate() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Library — save / load generated content
+// ═══════════════════════════════════════════════════════════════════════════
+function closeModal(){ g('modal-bg').style.display='none'; }
+function openModal(title){ g('modal-title').textContent=title; g('modal-bg').style.display='flex'; }
+
+async function savePlan() {
+  if (!S.plan) { toast('No plan to save','err'); return; }
+  syncPlan();
+  const name = prompt('Save plan as:', S.plan.title_card?.headline || S.plan.slug || 'plan');
+  if (name === null) return;
+  try {
+    await api('/api/library/plan','POST',{plan:S.plan, name});
+    toast('Plan saved to library');
+  } catch(e){ toast(e.message,'err'); }
+}
+
+async function openLibrary() {
+  openModal('Saved plans');
+  const body = g('modal-body');
+  body.innerHTML = '<div style="color:var(--muted);font-size:12px;">Loading…</div>';
+  try {
+    const data = await api('/api/library/plans');
+    if (!data.plans.length){ body.innerHTML='<div style="color:var(--muted);font-size:12px;">No saved plans yet.</div>'; return; }
+    body.innerHTML = data.plans.map(p=>`
+      <div class="story-card" style="cursor:default;">
+        <div class="s-top">
+          <span class="score-pill badge badge-info">${esc(p.brand||'')}</span>
+          <span class="story-title">${esc(p.name||p.id)}</span>
+        </div>
+        <div class="story-reason">${esc(p.format||'carousel')} · ${esc((p.when||'').replace('T',' '))}</div>
+        <div class="story-actions">
+          <button class="btn btn-primary btn-sm" onclick="loadSavedPlan('${esc(p.id)}')">Load</button>
+          <button class="btn btn-danger btn-sm" onclick="delSavedPlan('${esc(p.id)}',this)">Delete</button>
+        </div>
+      </div>`).join('');
+  } catch(e){ body.innerHTML=`<div style="color:var(--red);font-size:12px;">${esc(e.message)}</div>`; }
+}
+
+async function loadSavedPlan(id) {
+  try {
+    const data = await api('/api/library/plan/'+id);
+    loadPlan(data.plan);
+    closeModal();
+    showTab('editor', document.querySelectorAll('.nav-btn')[1]);
+    toast('Plan loaded');
+  } catch(e){ toast(e.message,'err'); }
+}
+async function delSavedPlan(id, btn) {
+  await api('/api/library/plan/'+id,'DELETE').catch(()=>{});
+  btn.closest('.story-card')?.remove();
+}
+
+async function saveStorySet() {
+  if (!S.stories.length){ toast('Fetch stories first','err'); return; }
+  try { await api('/api/library/stories','POST',{}); toast('Story set saved'); }
+  catch(e){ toast(e.message,'err'); }
+}
+
+async function openStoryLibrary() {
+  openModal('Saved story sets');
+  const body = g('modal-body');
+  body.innerHTML = '<div style="color:var(--muted);font-size:12px;">Loading…</div>';
+  try {
+    const data = await api('/api/library/stories');
+    if (!data.stories.length){ body.innerHTML='<div style="color:var(--muted);font-size:12px;">No saved sets yet.</div>'; return; }
+    body.innerHTML = data.stories.map(s=>`
+      <div class="story-card" style="cursor:default;">
+        <div class="s-top">
+          <span class="score-pill badge badge-info">${esc(s.brand||'')}</span>
+          <span class="story-title">${esc(s.name||s.id)}</span>
+        </div>
+        <div class="story-reason">${esc(s.count||'?')} stories · ${esc((s.when||'').replace('T',' '))}</div>
+        <div class="story-actions">
+          <button class="btn btn-primary btn-sm" onclick="loadSavedStories('${esc(s.id)}')">Load</button>
+          <button class="btn btn-danger btn-sm" onclick="delSavedStories('${esc(s.id)}',this)">Delete</button>
+        </div>
+      </div>`).join('');
+  } catch(e){ body.innerHTML=`<div style="color:var(--red);font-size:12px;">${esc(e.message)}</div>`; }
+}
+async function loadSavedStories(id) {
+  try {
+    const data = await api('/api/library/stories/'+id);
+    S.stories = data.stories || [];
+    renderStoriesList(S.stories);
+    closeModal();
+    toast(`Loaded ${S.stories.length} stories (no re-fetch)`);
+  } catch(e){ toast(e.message,'err'); }
+}
+async function delSavedStories(id, btn) {
+  await api('/api/library/stories/'+id,'DELETE').catch(()=>{});
+  btn.closest('.story-card')?.remove();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Utilities
 // ═══════════════════════════════════════════════════════════════════════════
 function g(id){return document.getElementById(id);}
+// The brand dropdown is the single source of truth for which brand every action uses.
+function curBrand(){ return document.getElementById('brand-sel')?.value || ''; }
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 async function api(url, method='GET', body=null) {

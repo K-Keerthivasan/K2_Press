@@ -1,12 +1,131 @@
 app:
-  name: "K2 Digital Media"
+  name: "K2 Studio"
 
-brand:
-  name:      "K2 Digital Media"
-  author:    "Keerthivasan"
-  handle:    "@k2digitalmedia_"
-  instagram: "k2digitalmedia_"
-  logo_path: "static/logo.png"
+# Which brand the app is currently posting for. Switch in the header dropdown.
+active_brand: k2
+
+# ── Brands ────────────────────────────────────────────────────────────────────
+# Each brand carries its own copy, theme colours, scoring profile, and RSS feeds.
+# Templates are shared — only the brand vars + theme change.
+brands:
+
+  k2:
+    name:      "K2 Digital Media"
+    short:     "K2"
+    author:    "Keerthivasan"
+    handle:    "@k2digitalmedia_"
+    instagram: "k2digitalmedia_"
+    tagline:   "The complete online presence for local business"
+    pitch:     "One agency. Four services."
+    services:  "Web · Video · Marketing · IT"
+    location:  "London, Ontario"
+    website:   "k2digitalmedia.ca"
+    email:     "info@k2digitalmedia.ca"
+    category:  "WEB DEVELOPMENT"
+    logo_path: "static/logo.png"
+    hashtags:  ["london", "ontario", "digitalmedia"]
+    theme:
+      navy:    "#0A0F1E"   # background base
+      navy2:   "#0C1426"
+      accent:  "#00B4C8"   # teal
+      accent2: "#00C896"   # green
+      text:    "#FFFFFF"
+    profile: >
+      K2 Digital Media is a full-service digital agency in London, Ontario, Canada
+      (web development & design, video & VFX, digital marketing & SEO, and IT).
+      It posts practical, trend-aware content positioning the agency as the local
+      expert for small and mid-sized businesses. Reward stories on web dev, design,
+      SEO/marketing, short-form video, and tech/business trends that can be made
+      actionable for a local business owner. Penalise hard news, crime, politics,
+      and gossip. Audience: business owners, marketers, and founders in SW Ontario.
+    feeds:
+      categories:
+        web_development:
+          name:    "Web Development & Design"
+          enabled: true
+          urls:
+            - "https://www.smashingmagazine.com/feed"
+            - "https://css-tricks.com/feed"
+            - "https://blog.codepen.io/feed"
+            - "https://github.blog/feed"
+            - "https://stackoverflow.blog/feed"
+        digital_marketing:
+          name:    "Digital Marketing & SEO"
+          enabled: true
+          urls:
+            - "https://moz.com/feeds/blog.rss"
+            - "https://blog.hubspot.com/marketing/rss.xml"
+            - "https://searchengineland.com/feed"
+            - "https://www.marketingdive.com/feeds/news"
+            - "https://digitalagencynetwork.com/feed"
+        tech_business:
+          name:    "Tech & Business"
+          enabled: true
+          urls:
+            - "https://techcrunch.com/feed"
+
+  jkr:
+    name:      "JKR"
+    short:     "JKR"
+    author:    "Keerthivasan"
+    handle:    "@jkr_studio_"
+    instagram: "jkr_studio_"
+    tagline:   "Games & film, decoded."
+    pitch:     "Gaming. Movies. Culture."
+    services:  "Games · Film · Reviews · News"
+    location:  ""
+    website:   ""
+    email:     ""
+    category:  "GAMING"
+    logo_path: "static/logo_jkr.png"
+    logo_shape: "wide"        # full wordmark (don't crop to a circle)
+    image_forward: true       # image-led layouts (image + text split)
+    hashtags:  ["gaming", "games", "film", "movies"]
+    templates:
+      title:   jkr_title.html
+      content: jkr_content.html
+      outro:   jkr_outro.html
+      cover:   cover.html
+    theme:
+      navy:    "#0B0B0F"   # near-black background
+      navy2:   "#141418"
+      accent:  "#ED1C24"   # JKR red
+      accent2: "#FF5A4D"
+      text:    "#FFFFFF"
+    profile: >
+      JKR is a gaming and film/entertainment page. It posts fast, opinionated,
+      fan-facing content about video games (AAA + indie, releases, trailers,
+      patches, studio news, leaks) and movies/TV (releases, casting, box office,
+      trailers, festival and awards news, reviews). Reward breaking news, trailers,
+      release dates, big industry moves, and strong takes that fans care about.
+      Penalise dry corporate filings with no fan angle, and unrelated hard news.
+    feeds:
+      categories:
+        video_games:
+          name:    "Video Games"
+          enabled: true
+          urls:
+            - "https://www.gamespot.com/feeds/news/"
+            - "https://www.theverge.com/rss/gaming/index.xml"
+            - "https://www.gamesindustry.biz/feed/news"
+            - "https://www.rockpapershotgun.com/feed"
+            - "https://www.videogameschronicle.com/category/news/feed/"
+            - "https://insider-gaming.com/feed/"
+        movies:
+          name:    "Movies & Entertainment"
+          enabled: true
+          urls:
+            - "https://deadline.com/feed/"
+            - "https://www.hollywoodreporter.com/feed/"
+            - "https://variety.com/v/film/feed/"
+            - "https://www.screendaily.com/rss/1151.xml"
+            - "https://www.rogerebert.com/feed"
+        hybrid:
+          name:    "Games + Movies (Hybrid)"
+          enabled: true
+          urls:
+            - "https://www.polygon.com/rss/index.xml"
+            - "https://feeds.feedburner.com/ign/all"
 
 llm:
   base_url: "http://localhost:11434/v1"
@@ -36,6 +155,12 @@ formats:
     width:  1080
     height: 1350
     type:   multi
+  cover:
+    name:     "Brand Cover"
+    width:    1080
+    height:   1350
+    type:     single
+    template: cover.html
   square:
     name:     "Square Post"
     width:    1080
@@ -54,40 +179,3 @@ formats:
     height:   900
     type:     single
     template: xpost.html
-
-feeds:
-  sample_url: "https://feeds.bbci.co.uk/news/world/rss.xml"
-
-  categories:
-
-    web_development:
-      name:    "Web Development & Design"
-      enabled: true
-      urls:
-        - "https://www.smashingmagazine.com/feed"
-        - "https://css-tricks.com/feed"
-        - "https://blog.codepen.io/feed"
-        - "https://github.blog/feed"
-        - "https://stackoverflow.blog/feed"
-
-    digital_marketing:
-      name:    "Digital Marketing & SEO"
-      enabled: true
-      urls:
-        - "https://moz.com/feeds/blog.rss"
-        - "https://blog.hubspot.com/marketing/rss.xml"
-        - "https://searchengineland.com/feed"
-        - "https://www.marketingdive.com/feeds/news"
-        - "https://digitalagencynetwork.com/feed"
-
-    tech_business:
-      name:    "Tech & Business"
-      enabled: true
-      urls:
-        - "https://techcrunch.com/feed"
-
-    custom:
-      name:    "Custom / Local"
-      enabled: false
-      urls:
-        - "TODO: add your local London Ontario news feeds here"

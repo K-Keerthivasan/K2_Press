@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <link rel="stylesheet" href="{{ css_path }}">
+  <style>{{ theme_css }}</style>
   <style>
     html, body { width: 1600px; height: 900px; }
     .slide    { width: 1600px; height: 900px; }
@@ -71,8 +72,8 @@
   <div class="layer">
     <div class="top-bar">
       <div class="brand-pill">
-        <img class="brand-logo-img" src="{{ logo_path }}" alt="K2 Digital Media">
-        <span class="brand-name">K2 Digital Media</span>
+        <img class="brand-logo-img" src="{{ logo_path }}" alt="{{ brand.name }}">
+        <span class="brand-name">{{ brand.name }}</span>
       </div>
       <span class="handle-top">{{ handle }}</span>
     </div>
@@ -84,7 +85,7 @@
     </div>
 
     <div class="bottom-bar">
-      <span class="footer-label">K2 Digital Media</span>
+      <span class="footer-label">{{ brand.name }}</span>
       <span class="handle-foot">{{ handle }}</span>
     </div>
   </div>

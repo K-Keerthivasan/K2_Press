@@ -11,12 +11,43 @@ import yaml
 from jinja2 import Environment, FileSystemLoader
 from playwright.sync_api import sync_playwright
 
+from brands import resolve_brand, theme_css, brand_template
+
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
 def _load_config() -> dict:
     with open("config.yaml", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+# Watermark position presets (editor-controllable). Values are inline CSS for .wm.
+_WM_POS = {
+    "center":       "left:50%;top:55%;transform:translate(-50%,-50%)",
+    "top":          "left:50%;top:6%;transform:translate(-50%,0)",
+    "bottom":       "left:50%;top:100%;transform:translate(-50%,-62%)",
+    "left":         "left:2%;top:55%;transform:translate(-38%,-50%)",
+    "right":        "left:98%;top:55%;transform:translate(-62%,-50%)",
+    "top-left":     "left:4%;top:6%;transform:translate(-35%,-30%)",
+    "top-right":    "left:96%;top:6%;transform:translate(-65%,-30%)",
+    "bottom-left":  "left:4%;top:100%;transform:translate(-35%,-66%)",
+    "bottom-right": "left:96%;top:100%;transform:translate(-65%,-66%)",
+}
+_BADGE_JUSTIFY = {"left": "flex-start", "center": "center", "right": "flex-end"}
+
+
+def _layout_vars(plan: dict | None) -> dict:
+    """Editor-controllable layout: watermark position/opacity + badge alignment."""
+    layout = (plan or {}).get("layout") or {}
+    pos = _WM_POS.get(layout.get("wm_pos", "center"), _WM_POS["center"])
+    try:
+        opacity = float(layout.get("wm_opacity", 5)) / 100
+    except (TypeError, ValueError):
+        opacity = 0.05
+    return {
+        "wm_style":      f"{pos};opacity:{opacity:.3f}",
+        "badge_justify": _BADGE_JUSTIFY.get(layout.get("badge_align", "center"), "center"),
+    }
 
 
 def _uri(path: str | Path | None) -> str | None:
@@ -88,7 +119,7 @@ def generate_carousel(plan: dict, image_paths: dict | None = None,
                       out_root: Path | None = None) -> Path:
     """Render all slides for a plan. Returns the output directory path."""
     config    = _load_config()
-    brand     = config.get("brand", {})
+    brand     = resolve_brand(config)
     out_cfg   = config.get("output", {})
     width     = out_cfg.get("width",  1080)
     height    = out_cfg.get("height", 1350)
@@ -112,9 +143,22 @@ def generate_carousel(plan: dict, image_paths: dict | None = None,
         "logo_path":    logo_uri,
         "author":       author,
         "handle":       handle,
+        "brand":        brand,
+        "theme_css":    theme_css(brand),
         "plan":         plan,
         "total_slides": total_slides,
+        **_layout_vars(plan),
     }
+
+    t_title   = brand_template(brand, "title",   "title.html")
+    t_content = brand_template(brand, "content", "content.html")
+    t_outro   = brand_template(brand, "outro",   "outro.html")
+    # Image-forward brands (e.g. JKR) show a hero image on the title card; reuse
+    # the first content slide's image so the cover leads with a visual.
+    title_img = None
+    if brand.get("image_forward"):
+        first = (image_paths or {}).get(0)
+        title_img = _uri(first) if first else None
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
@@ -123,8 +167,8 @@ def generate_carousel(plan: dict, image_paths: dict | None = None,
 
         # 1 – Title card
         out_file = out_dir / "01_title.png"
-        render_slide(page, env, "title.html",
-                     {**base, "background_image": None},
+        render_slide(page, env, t_title,
+                     {**base, "background_image": title_img},
                      out_file, width, height)
         print(f"  [ok] 01_title.png")
 
@@ -132,7 +176,7 @@ def generate_carousel(plan: dict, image_paths: dict | None = None,
         for i, slide in enumerate(content_slides):
             img_path = (image_paths or {}).get(i)
             out_file = out_dir / f"{i+2:02d}_content.png"
-            render_slide(page, env, "content.html",
+            render_slide(page, env, t_content,
                          {**base,
                           "slide":            slide,
                           "slide_number":     i + 1,
@@ -142,7 +186,7 @@ def generate_carousel(plan: dict, image_paths: dict | None = None,
 
         # Last – Outro card
         out_file = out_dir / f"{total_slides:02d}_outro.png"
-        render_slide(page, env, "outro.html",
+        render_slide(page, env, t_outro,
                      {**base, "background_image": None},
                      out_file, width, height)
         print(f"  [ok] {out_file.name}")
@@ -173,7 +217,7 @@ def generate_single(
 ) -> Path:
     """Render a single-card post (square/story/x). Returns the output directory."""
     config = _load_config()
-    brand  = config.get("brand", {})
+    brand  = resolve_brand(config)
     fcfg   = format_config(fmt, config)
     width  = fcfg.get("width", 1080)
     height = fcfg.get("height", 1080)
@@ -189,8 +233,12 @@ def generate_single(
         "logo_path":        _uri(Path(brand.get("logo_path", "static/logo.png"))),
         "handle":           brand.get("handle", "@k2digitalmedia_"),
         "author":           brand.get("author", "Keerthivasan"),
+        "brand":            brand,
+        "theme_css":        theme_css(brand),
+        "plan":             plan,
         "post":             plan,
         "background_image": _uri(image_path),
+        **_layout_vars(plan),
     }
 
     env = Environment(loader=FileSystemLoader("templates"))
@@ -242,15 +290,17 @@ def generate_post(
 
 def _base_vars(plan: dict, image_paths: dict | None = None) -> dict:
     config   = _load_config()
-    brand    = config.get("brand", {})
-    out_cfg  = config.get("output", {})
+    brand    = resolve_brand(config)
     return {
         "css_path":     _uri(Path("static/brand.css")),
         "logo_path":    _uri(Path(brand.get("logo_path", "static/logo.png"))),
         "author":       brand.get("author", "Keerthivasan"),
         "handle":       brand.get("handle", "@k2digitalmedia_"),
+        "brand":        brand,
+        "theme_css":    theme_css(brand),
         "plan":         plan,
         "total_slides": 1 + len(plan.get("content_slides", [])) + 1,
+        **_layout_vars(plan),
     }
 
 

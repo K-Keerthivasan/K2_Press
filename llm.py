@@ -46,19 +46,35 @@ def _clean_json(text: str) -> dict:
         raise ValueError(f"No valid JSON in model output:\n{text[:400]}")
 
 
-def chat_json(system: str, user: str, model: str | None = None) -> dict:
-    """Send a chat request that returns structured JSON."""
+def chat_json(system: str, user: str, model: str | None = None,
+              retries: int = 1) -> dict:
+    """Send a chat request that returns structured JSON.
+
+    Local models occasionally emit malformed JSON; retry a couple of times
+    (nudging the model to output strict JSON) before giving up so a single
+    flaky response doesn't fail a whole batch item.
+    """
     client, mdl = _client(model)
-    resp = client.chat.completions.create(
-        model=mdl,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.3,
-    )
-    return _clean_json(resp.choices[0].message.content)
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
+    ]
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        resp = client.chat.completions.create(
+            model=mdl,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.3 if attempt == 0 else 0.1,
+        )
+        try:
+            return _clean_json(resp.choices[0].message.content)
+        except (ValueError, json.JSONDecodeError) as e:
+            last_err = e
+            messages.append({"role": "user",
+                             "content": "Your previous reply was not valid JSON. "
+                                        "Reply again with ONLY a single valid JSON object."})
+    raise last_err  # type: ignore[misc]
 
 
 def list_models(base_url: str | None = None) -> list[str]:

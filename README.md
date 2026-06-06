@@ -57,8 +57,9 @@ UNSPLASH_API_KEY=your_unsplash_key    # optional, free at unsplash.com/developer
 3. **Canvas** — mirrors the HTML, doesn't replace it. **Load Editor Slide** pulls the real
    text + background of the slide you're editing into a Fabric.js canvas so you can nudge type
    and layout by hand, then **Export PNG**. The HTML render stays the source of truth.
-4. **Templates** — edit any template (`title/content/outro/square/story/xpost.html`) or
-   `brand.css` with live preview. Saves are backed up as `.bak`.
+4. **Templates** — edit any template (`title/content/outro/cover/square/story/xpost.html`) or
+   `brand.css` with live preview. Saves are backed up as `.bak`. `cover.html` is the standalone
+   brand-splash card (the big K2 wordmark); it reads brand copy from `config.yaml` (`brand:`).
 
 ## Formats
 
@@ -110,7 +111,7 @@ run.bat              one-click launcher
 static/
   brand.css          brand variables + slide base styles + image wash
   logo.png           K2 Digital Media logo
-templates/           title.html · content.html · outro.html
+templates/           title.html · content.html · outro.html · cover.html
 feeds.py             RSS/Atom ingestion (category-aware)
 filter.py            Ollama relevance scoring
 plan.py              Ollama post planning (strict JSON, 3–10 slides)

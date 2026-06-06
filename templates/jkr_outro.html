@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="{{ css_path }}">
+  <style>{{ theme_css }}</style>
+  <style>
+    .outro-bg {
+      background:
+        radial-gradient(120% 90% at 50% 0%, color-mix(in srgb, var(--teal) 70%, #000) 0%, var(--navy) 60%);
+    }
+    .outro-bg::before {
+      background: linear-gradient(180deg, rgba(0,0,0,0.15), rgba(0,0,0,0.55));
+    }
+    .layer {
+      position: relative; z-index: 2; height: 100%;
+      display: flex; flex-direction: column; align-items: center;
+      text-align: center; padding: 96px 80px 84px;
+    }
+    .kicker {
+      display: inline-block;
+      font-size: 22px; font-weight: 700; letter-spacing: 6px;
+      text-transform: uppercase; color: var(--teal);
+      padding: 10px 22px; border: 2px solid var(--teal); border-radius: 40px;
+    }
+    .cta-area { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 30px; }
+    .cta {
+      margin: 0; font-size: 70px; font-weight: 700; line-height: 1.04;
+      letter-spacing: -1.5px; color: #fff; text-transform: uppercase; max-width: 880px;
+      text-shadow: 0 0 40px color-mix(in srgb, var(--teal) 50%, transparent);
+    }
+    .action {
+      margin: 0; font-size: 34px; font-weight: 500; color: rgba(255,255,255,0.92);
+      white-space: pre-line;
+    }
+    .bars { display: flex; gap: 10px; }
+    .bars span { width: 56px; height: 6px; border-radius: 3px; background: var(--teal); opacity: .9; }
+    .bars span:nth-child(2){ opacity:.6; } .bars span:nth-child(3){ opacity:.3; }
+
+    .footer { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+    .b-logo { height: 60px; width: auto; object-fit: contain; }
+    .handle { font-size: 26px; font-weight: 700; color: rgba(255,255,255,0.85); letter-spacing: 1px; }
+  </style>
+</head>
+<body>
+<main class="slide outro-bg">
+  <img class="wm" src="{{ logo_path }}" style="{{ wm_style }}" alt="">
+
+  <div class="layer">
+    <span class="kicker">Level Up</span>
+
+    <div class="cta-area">
+      <div class="bars"><span></span><span></span><span></span></div>
+      <h2 class="cta">{{ plan.outro_card.cta }}</h2>
+      <p class="action">{{ plan.outro_card.handle }}</p>
+    </div>
+
+    <div class="footer">
+      <img class="b-logo" src="{{ logo_path }}" alt="{{ brand.name }}">
+      <span class="handle">{{ handle }}</span>
+    </div>
+  </div>
+</main>
+</body>
+</html>

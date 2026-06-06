@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <link rel="stylesheet" href="{{ css_path }}">
+  <style>{{ theme_css }}</style>
   <style>
     html, body { width: 1080px; height: 1920px; }
     .slide    { width: 1080px; height: 1920px; }
@@ -78,13 +79,13 @@
   {% if background_image %}
   <img class="bg-image" src="{{ background_image }}" alt="">
   {% endif %}
-  <img class="wm" src="{{ logo_path }}" alt="">
+  <img class="wm" src="{{ logo_path }}" style="{{ wm_style }}" alt="">
 
   <div class="layer">
     <div class="top-bar">
       <div class="brand-pill">
-        <img class="brand-logo-img" src="{{ logo_path }}" alt="K2 Digital Media">
-        <span class="brand-name">K2 Digital Media</span>
+        <img class="brand-logo-img" src="{{ logo_path }}" alt="{{ brand.name }}">
+        <span class="brand-name">{{ brand.name }}</span>
       </div>
       <span class="handle-top">{{ handle }}</span>
     </div>

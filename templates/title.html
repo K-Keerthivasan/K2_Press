@@ -3,66 +3,45 @@
 <head>
   <meta charset="utf-8">
   <link rel="stylesheet" href="{{ css_path }}">
+  <style>{{ theme_css }}</style>
   <style>
-    .title-slide::before { display: none; }  /* pure navy — no overlay needed */
-
     .layer {
       position: relative;
       z-index: 2;
       height: 100%;
       display: flex;
       flex-direction: column;
-      padding: 68px 76px 72px;
+      padding: 84px 88px 88px;
     }
-
-    .top-bar {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-    }
-    .brand-pill {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
-    .brand-logo-img {
-      width: 58px;
-      height: 58px;
-      border-radius: 50%;
-      object-fit: contain;
-    }
-    .brand-info { display: flex; flex-direction: column; gap: 5px; }
-    .brand-name  { font-size: 27px; font-weight: 700; line-height: 1; color: #fff; }
-    .brand-sub   { font-size: 17px; color: rgba(255,255,255,0.48); line-height: 1; }
-    .handle-top  { font-size: 22px; font-weight: 600; color: var(--teal); }
 
     .headline-wrap {
       flex: 1;
       display: flex;
-      align-items: center;
+      flex-direction: column;
+      justify-content: center;
+      gap: 26px;
     }
     .headline {
       margin: 0;
-      font-size: 92px;
-      font-weight: 800;
-      line-height: 1.01;
+      font-size: 70px;
+      font-weight: 700;
+      line-height: 1.12;
       color: #fff;
       max-width: 880px;
-      letter-spacing: -1px;
+      letter-spacing: -1.5px;
+    }
+    .subhead {
+      margin: 0;
+      font-size: 27px;
+      font-weight: 400;
+      color: rgba(255,255,255,0.62);
+      line-height: 1.35;
+      max-width: 760px;
     }
 
     .bottom {
       display: flex;
-      flex-direction: column;
-      gap: 18px;
-    }
-    .subhead {
-      margin: 0;
-      font-size: 38px;
-      font-weight: 400;
-      color: rgba(255,255,255,0.72);
-      line-height: 1.22;
-      max-width: 820px;
+      justify-content: center;
     }
   </style>
 </head>
@@ -71,26 +50,27 @@
   {% if background_image %}
   <img class="bg-image" src="{{ background_image }}" alt="">
   {% endif %}
-  <img class="wm" src="{{ logo_path }}" alt="">
+  <img class="wm" src="{{ logo_path }}" style="{{ wm_style }}" alt="">
 
   <div class="layer">
-    <div class="top-bar">
-      <div class="brand-pill">
-        <img class="brand-logo-img" src="{{ logo_path }}" alt="K2 Digital Media">
-        <div class="brand-info">
-          <span class="brand-name">K2 Digital Media</span>
-        </div>
+    <div class="lockup">
+      <img class="mark" src="{{ logo_path }}" alt="{{ brand.name }}">
+      <div class="l-text">
+        <span class="l-name">{{ brand.name }}</span>
+        <span class="l-tag">{{ brand.tagline }}</span>
       </div>
-      <span class="handle-top">{{ handle }}</span>
     </div>
 
     <div class="headline-wrap">
       <h1 class="headline">{{ plan.title_card.headline }}</h1>
+      {% if plan.title_card.subhead %}
+      <span class="teal-rule"></span>
+      <p class="subhead">{{ plan.title_card.subhead }}</p>
+      {% endif %}
     </div>
 
     <div class="bottom">
-      <span class="teal-rule"></span>
-      <p class="subhead">{{ plan.title_card.subhead }}</p>
+      <span class="meta-line">{{ handle }}</span>
     </div>
   </div>
 </main>
