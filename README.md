@@ -25,6 +25,10 @@ opens your browser at `http://localhost:8000`.
 
 ### First-time setup
 
+On Windows, run **`setup.bat`** for the full local setup. It creates the virtual environment,
+installs dependencies, installs Playwright Chromium, creates a placeholder `.env` if needed,
+and can build the Docker image when Docker Compose is available.
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -39,6 +43,16 @@ Add API keys to `.env`:
 PEXELS_API_KEY=your_pexels_key        # free at pexels.com/api
 UNSPLASH_API_KEY=your_unsplash_key    # optional, free at unsplash.com/developers
 ```
+
+### Docker
+
+```powershell
+docker compose up --build
+```
+
+Open `http://localhost:8000`. The compose setup maps `outputs/`, `image_cache/`, and
+`library/` back to the project folder, and points containerized Ollama requests to
+`http://host.docker.internal:11434/v1`.
 
 ---
 

@@ -7,3 +7,4 @@ uvicorn[standard]
 python-dotenv
 requests
 openai
+Pillow

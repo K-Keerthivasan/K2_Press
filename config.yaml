@@ -137,6 +137,18 @@ output:
   height:    1350
   directory: "outputs"
 
+# ── Image sourcing ────────────────────────────────────────────────────────────
+# Sources: pexels, unsplash, google (Programmable Search — needs GOOGLE_API_KEY
+# and GOOGLE_CSE_ID in .env). The "slight filter" below is baked into web/Google
+# images on download (Pillow). Tune globally here, or override per brand with a
+# brand-level `image_filter:` block (same keys). Set enabled:false to skip it.
+images:
+  filter:
+    enabled:    true
+    saturation: 0.85   # <1 = less saturated
+    brightness: 0.95   # <1 = darker
+    contrast:   1.05   # >1 = punchier
+
 slides:
   min_content_cards: 1    # min total = 3 (title + 1 + outro)
   max_content_cards: 8    # max total = 10 (title + 8 + outro)

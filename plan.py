@@ -23,6 +23,20 @@ def _safe_profile() -> str:
         return "A social media brand."
 
 
+def _tone_directive(tone: str) -> str:
+    """A system-prompt block that bends the generated content toward a chosen
+    stance (e.g. 'positive', 'negative', 'critical') without inventing facts."""
+    tone = (tone or "").strip()
+    if not tone:
+        return ""
+    return (
+        "\nTONE & PERSPECTIVE:\n"
+        f"- Take a {tone} stance toward this topic.\n"
+        "- Let that perspective shape the headline, the framing, and which points\n"
+        "  you emphasise — while staying factual and true to the source story.\n"
+    )
+
+
 def _auto_content_cards(story: Story, config: dict) -> int:
     words     = len(story.summary.split())
     threshold = config.get("slides", {}).get("short_story", {}).get("max_summary_words", 220)
@@ -37,6 +51,7 @@ def plan_story(
     total_slides: int | None = None,   # explicit override (3-10)
     model: str | None = None,
     brand: dict | None = None,
+    tone: str = "",                    # per-post stance (positive/negative/…)
 ) -> dict:
     if config is None:
         config = load_config()
@@ -60,7 +75,9 @@ def plan_story(
     location   = brand.get("location", "")
     loc_rule   = (f"- Make {location} relevance explicit when it is not obvious.\n"
                   if location else "")
-    extra_ctx  = (brand.get("tone") or "")  # optional per-plan/brand tone hint
+    # Per-post tone wins; fall back to a brand-level default tone if set.
+    eff_tone   = (tone or brand.get("tone") or "").strip()
+    extra_ctx  = _tone_directive(eff_tone)
 
     system = f"""You are an Instagram carousel content planner for {brand_name}.
 You write clear, value-first posts — no fluff, no hype.
@@ -105,7 +122,10 @@ RULES:
         f"Source URL:    {story.url}"
     )
 
-    return chat_json(system, user, model=model)
+    plan = chat_json(system, user, model=model)
+    if eff_tone:
+        plan["tone"] = eff_tone
+    return plan
 
 
 # ── Single-card formats (square / story / x) ─────────────────────────────────
@@ -116,6 +136,7 @@ def plan_single(
     config: dict | None = None,
     model: str | None = None,
     brand: dict | None = None,
+    tone: str = "",              # per-post stance (positive/negative/…)
 ) -> dict:
     """Plan a single-card post. Returns format-appropriate JSON."""
     if config is None:
@@ -131,6 +152,8 @@ def plan_single(
     location   = brand.get("location", "")
     loc_rule   = (f"- Make {location} relevance explicit when it is not obvious.\n"
                   if location else "")
+    eff_tone   = (tone or brand.get("tone") or "").strip()
+    extra_ctx  = _tone_directive(eff_tone)
 
     fmt_notes = {
         "square": "A single square (1080x1080) Instagram feed post. One bold headline plus "
@@ -154,7 +177,7 @@ social posts — no fluff.
 
 CREATOR PROFILE:
 {profile}
-
+{extra_ctx}
 FORMAT: {note}
 
 Return ONE valid JSON object (no markdown, no code fences) with EXACTLY these keys:
@@ -181,6 +204,8 @@ RULES:
     )
     plan = chat_json(system, user, model=model)
     plan.setdefault("format", fmt)
+    if eff_tone:
+        plan["tone"] = eff_tone
     return plan
 
 
@@ -191,16 +216,18 @@ def plan_post(
     total_slides: int | None = None,
     model: str | None = None,
     brand: dict | None = None,
+    tone: str = "",
 ) -> dict:
     """Dispatch: carousel -> multi-slide plan; everything else -> single-card plan."""
     if fmt == "carousel":
-        plan = plan_story(story, config, total_slides=total_slides, model=model, brand=brand)
+        plan = plan_story(story, config, total_slides=total_slides, model=model,
+                          brand=brand, tone=tone)
         plan.setdefault("format", "carousel")
         return plan
     if fmt == "cover":
         # The brand-cover card is purely static brand furniture — no LLM call.
         return {"format": "cover", "slug": "brand-cover"}
-    return plan_single(story, fmt, config=config, model=model, brand=brand)
+    return plan_single(story, fmt, config=config, model=model, brand=brand, tone=tone)
 
 
 def regen_caption(plan: dict, brand: dict | None = None, config: dict | None = None,

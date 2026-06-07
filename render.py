@@ -11,7 +11,7 @@ import yaml
 from jinja2 import Environment, FileSystemLoader
 from playwright.sync_api import sync_playwright
 
-from brands import resolve_brand, theme_css, brand_template
+from brands import resolve_brand, theme_css, brand_template, active_key
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -129,7 +129,8 @@ def generate_carousel(plan: dict, image_paths: dict | None = None,
     handle    = brand.get("handle", "@k2digitalmedia_")
 
     slug      = plan.get("slug", "post")
-    root      = out_root or Path(out_cfg.get("directory", "outputs"))
+    bkey      = active_key(config) or "default"
+    root      = out_root or (Path(out_cfg.get("directory", "outputs")) / bkey)
     out_dir   = root / f"{date.today().isoformat()}_{slug}_carousel"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -224,7 +225,8 @@ def generate_single(
     tmpl   = fcfg.get("template", f"{fmt}.html")
 
     slug    = plan.get("slug", "post")
-    root    = out_root or Path(config.get("output", {}).get("directory", "outputs"))
+    bkey    = active_key(config) or "default"
+    root    = out_root or (Path(config.get("output", {}).get("directory", "outputs")) / bkey)
     out_dir = root / f"{date.today().isoformat()}_{slug}_{fmt}"
     out_dir.mkdir(parents=True, exist_ok=True)
 

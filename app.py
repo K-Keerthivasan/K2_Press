@@ -38,7 +38,17 @@ _session: dict[str, Any] = {
     "plan":         None,
     "image_paths":  {},   # {str(slide_idx): str path}
     "rendered_dir": None,
+    "used_urls":    set(),  # stories already generated this session — not re-served
 }
+
+def _mark_used(*urls: str | None) -> None:
+    """Remember stories we've generated from so a re-fetch won't surface them
+    again this session. Reset on brand switch (or via /api/session/reset)."""
+    seen = _session.setdefault("used_urls", set())
+    for u in urls:
+        if u:
+            seen.add(u)
+
 
 # Single-flight guard: only one heavy LLM job (fetch/plan/batch) at a time so a
 # page refresh + re-click can't stack overlapping Ollama runs.
@@ -83,7 +93,7 @@ def _sync_list_models():
     return list_models()
 
 
-def _sync_fetch_stories(limit, top_n, category, model):
+def _sync_fetch_stories(limit, top_n, category, model, exclude=()):
     from feeds import fetch_stories, configured_feed_urls, load_config
     from filter import rank_stories
     from brands import resolve_brand, brand_feeds_config
@@ -96,20 +106,25 @@ def _sync_fetch_stories(limit, top_n, category, model):
         if not urls_all:
             raise ValueError(f"No feed URLs configured for brand '{brand.get('name','')}'.")
         urls = urls_all
-    stories = fetch_stories(urls)[:limit]
+    stories = fetch_stories(urls)
+    # Drop stories already generated this session so a re-fetch surfaces fresh ones.
+    if exclude:
+        stories = [s for s in stories if s.url not in exclude]
+    stories = stories[:limit]
     ranked  = rank_stories(stories, top_n, model=model, brand=brand,
                            should_cancel=_cancelled)
     return [vars(r) for r in ranked]
 
 
-def _sync_generate_plan(story_dict, total_slides, model):
+def _sync_generate_plan(story_dict, total_slides, model, tone=""):
     from feeds import Story
     from plan import plan_story
     from brands import resolve_brand
     story  = Story(**story_dict)
     config = _cfg()
     brand  = resolve_brand(config)
-    return plan_story(story, config, total_slides=total_slides, model=model, brand=brand)
+    return plan_story(story, config, total_slides=total_slides, model=model,
+                      brand=brand, tone=tone)
 
 
 def _sync_regen_caption(plan, tone):
@@ -131,16 +146,43 @@ def _sync_swap_pexels(query, source):
     return str(p)
 
 
-def _sync_fetch_url(url, name):
+def _sync_search_images(query, source, count):
+    from images import search_images
+    return search_images(query, source, count)
+
+
+def _sync_fetch_url(url, name, do_filter=True):
     from images import fetch_from_url
-    p = fetch_from_url(url, name)
+    p = fetch_from_url(url, name, do_filter=do_filter)
     return str(p)
 
 
-def _sync_render_carousel(plan, image_paths):
+# Renders are grouped per brand: outputs/<brand>/<date>_<slug>_<format>/.
+# When a caller passes save=False (automation / preview), the render lands in a
+# throwaway outputs/_tmp/<brand> that is wiped at the start of each unsaved run,
+# so nothing accumulates on disk unless a run explicitly asks to keep it.
+TMP_OUT = Path("outputs/_tmp")
+
+
+def _out_root_for(brand_key: str, save: bool) -> Path:
+    base = Path("outputs") if save else TMP_OUT
+    return base / (brand_key or "default")
+
+
+def _clear_tmp() -> None:
+    import shutil
+    shutil.rmtree(TMP_OUT, ignore_errors=True)
+
+
+def _sync_render_carousel(plan, image_paths, save=True):
     from render import generate_carousel
+    from brands import active_key
+    bkey = active_key(_cfg()) or "default"
+    if not save:
+        _clear_tmp()
+    out_root  = _out_root_for(bkey, save)
     int_paths = {int(k): (Path(v) if v else None) for k, v in image_paths.items()}
-    return str(generate_carousel(plan, int_paths))
+    return str(generate_carousel(plan, int_paths, out_root=out_root))
 
 
 def _sync_preview_slide(template, variables):
@@ -194,18 +236,25 @@ EDITABLE_FILES = {
 }
 
 
-def _sync_batch_run(items, model, source):
-    """Plan + fetch images + render every (story, format) pair into one batch folder."""
-    from datetime import datetime
+def _sync_batch_run(items, model, source, save=True, tone=""):
+    """Plan + fetch images + render every (story, format) pair.
+
+    Output lands in outputs/<brand>/ (or a throwaway outputs/_tmp/<brand> when
+    save is False). ``tone`` is the run-level stance; an item may override it
+    with its own ``tone`` key.
+    """
     from feeds import Story
     from plan import plan_post
     from images import fetch_images_for_plan, fetch_image
     from render import generate_post
-    from brands import resolve_brand
+    from brands import resolve_brand, active_key
 
     config    = _cfg()
     brand     = resolve_brand(config)
-    batch_dir = Path("outputs") / f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    brand_key = active_key(config) or "default"
+    if not save:
+        _clear_tmp()
+    out_root  = _out_root_for(brand_key, save)
     results   = []
 
     cancelled = False
@@ -214,13 +263,15 @@ def _sync_batch_run(items, model, source):
             cancelled = True
             break
         story = Story(**item["story"])
+        item_tone = item.get("tone", tone)
         for fmt in item.get("formats", ["carousel"]):
             if _cancelled():
                 cancelled = True
                 break
             try:
                 plan = plan_post(story, fmt, config=config,
-                                 total_slides=item.get("total_slides"), model=model, brand=brand)
+                                 total_slides=item.get("total_slides"), model=model,
+                                 brand=brand, tone=item_tone)
                 # images
                 if fmt == "carousel":
                     img_paths = fetch_images_for_plan(plan, source=source)
@@ -233,13 +284,13 @@ def _sync_batch_run(items, model, source):
                         except Exception as ie:
                             print(f"[batch] image fail '{q}': {ie}")
                             img_paths = None
-                out_dir = generate_post(plan, fmt, img_paths, out_root=batch_dir)
+                out_dir = generate_post(plan, fmt, img_paths, out_root=out_root)
                 files   = sorted(p.name for p in Path(out_dir).glob("*.png"))
                 results.append({
                     "title":   story.title,
                     "format":  fmt,
                     "slug":    plan.get("slug", ""),
-                    "rel":     str(Path(out_dir).relative_to("outputs")).replace("\\", "/"),
+                    "rel":     Path(out_dir).relative_to("outputs").as_posix(),
                     "files":   files,
                     "caption": plan.get("caption", ""),
                     "plan":    plan,
@@ -249,7 +300,8 @@ def _sync_batch_run(items, model, source):
             except Exception as e:
                 results.append({"title": story.title, "format": fmt, "ok": False, "error": str(e)})
 
-    return {"batch_dir": str(batch_dir), "results": results, "cancelled": cancelled}
+    return {"batch_dir": out_root.as_posix(), "saved": save,
+            "results": results, "cancelled": cancelled}
 
 
 # ── API: models ───────────────────────────────────────────────────────────────
@@ -279,14 +331,17 @@ async def api_batch_run(body: dict = Body(...)):
     items  = body.get("items", [])
     model  = body.get("model") or None
     source = body.get("source", "pexels")
+    save   = body.get("save", True)
+    tone   = body.get("tone", "")
     if not items:
         raise HTTPException(400, "No items selected.")
     _apply_brand(body.get("brand"))
     _acquire("batch")
     t0 = time.time()
     try:
-        out = await _run(_sync_batch_run, items, model, source)
+        out = await _run(_sync_batch_run, items, model, source, save, tone)
         out["elapsed"] = round(time.time() - t0, 1)
+        _mark_used(*[(it.get("story") or {}).get("url") for it in items])
         return out
     except HTTPException:
         raise
@@ -315,6 +370,16 @@ async def api_cancel():
         _cancel["flag"] = True
         return {"ok": True, "cancelling": job}
     return {"ok": False, "cancelling": None}
+
+
+# ── API: session ──────────────────────────────────────────────────────────────
+@app.post("/api/session/reset")
+async def api_session_reset(body: dict = Body(default={})):
+    """Forget which stories were already generated this session (the dedup set),
+    so previously-used stories can be served again on the next fetch."""
+    n = len(_session.get("used_urls") or ())
+    _session["used_urls"] = set()
+    return {"ok": True, "cleared": n}
 
 
 # ── API: brands ────────────────────────────────────────────────────────────────
@@ -363,6 +428,7 @@ async def api_set_brand(body: dict = Body(...)):
     _session["stories"]     = []
     _session["plan"]        = None
     _session["image_paths"] = {}
+    _session["used_urls"]   = set()
     b = resolve_brand(config)
     return {
         "ok":     True,
@@ -397,14 +463,21 @@ def _apply_brand(key: str | None) -> None:
 
 
 def _lib_list(folder: Path) -> list[dict]:
+    # rglob: saved items live in per-brand subfolders (library/plans/<brand>/…).
     items = []
-    for f in sorted(folder.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+    for f in sorted(folder.rglob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             meta = json.loads(f.read_text(encoding="utf-8")).get("meta", {})
         except Exception:
             meta = {}
         items.append({"id": f.stem, **meta})
     return items
+
+
+def _lib_path(folder: Path, fid: str) -> Path | None:
+    """Locate a saved item by id across the brand subfolders (or legacy root)."""
+    fid = _slug_id(fid)
+    return next(iter(folder.rglob(f"{fid}.json")), None)
 
 
 @app.post("/api/library/plan")
@@ -415,11 +488,16 @@ async def api_lib_save_plan(body: dict = Body(default={})):
     name = body.get("name") or plan.get("title_card", {}).get("headline") \
         or plan.get("headline") or plan.get("slug", "plan")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    bkey  = _active_brand_key() or "default"
     fid   = f"{_slug(name)}-{stamp}"
-    meta  = {"name": name, "brand": _active_brand_key(),
+    meta  = {"name": name, "brand": bkey,
              "slug": plan.get("slug", ""), "format": plan.get("format", "carousel"),
+             "tone": plan.get("tone", ""),
+             "caption": plan.get("caption", ""),
              "when": datetime.now().isoformat(timespec="seconds")}
-    (LIB_PLANS / f"{fid}.json").write_text(
+    dest  = LIB_PLANS / bkey
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / f"{fid}.json").write_text(
         json.dumps({"meta": meta, "plan": plan}, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"ok": True, "id": fid, "meta": meta}
 
@@ -431,8 +509,8 @@ async def api_lib_plans():
 
 @app.get("/api/library/plan/{fid}")
 async def api_lib_get_plan(fid: str):
-    f = LIB_PLANS / f"{_slug_id(fid)}.json"
-    if not f.exists():
+    f = _lib_path(LIB_PLANS, fid)
+    if not f:
         raise HTTPException(404, fid)
     data = json.loads(f.read_text(encoding="utf-8"))
     _session["plan"]        = data.get("plan")
@@ -442,8 +520,9 @@ async def api_lib_get_plan(fid: str):
 
 @app.delete("/api/library/plan/{fid}")
 async def api_lib_del_plan(fid: str):
-    f = LIB_PLANS / f"{_slug_id(fid)}.json"
-    f.unlink(missing_ok=True)
+    f = _lib_path(LIB_PLANS, fid)
+    if f:
+        f.unlink(missing_ok=True)
     return {"ok": True}
 
 
@@ -458,7 +537,9 @@ async def api_lib_save_stories(body: dict = Body(default={})):
     fid   = f"{_slug(bkey)}-{stamp}"
     meta  = {"name": name, "brand": bkey, "count": len(stories),
              "when": datetime.now().isoformat(timespec="seconds")}
-    (LIB_STORIES / f"{fid}.json").write_text(
+    dest  = LIB_STORIES / (bkey or "default")
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / f"{fid}.json").write_text(
         json.dumps({"meta": meta, "stories": stories}, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"ok": True, "id": fid, "meta": meta}
 
@@ -470,8 +551,8 @@ async def api_lib_stories():
 
 @app.get("/api/library/stories/{fid}")
 async def api_lib_get_stories(fid: str):
-    f = LIB_STORIES / f"{_slug_id(fid)}.json"
-    if not f.exists():
+    f = _lib_path(LIB_STORIES, fid)
+    if not f:
         raise HTTPException(404, fid)
     data = json.loads(f.read_text(encoding="utf-8"))
     _session["stories"] = data.get("stories", [])
@@ -480,8 +561,34 @@ async def api_lib_get_stories(fid: str):
 
 @app.delete("/api/library/stories/{fid}")
 async def api_lib_del_stories(fid: str):
-    (LIB_STORIES / f"{_slug_id(fid)}.json").unlink(missing_ok=True)
+    f = _lib_path(LIB_STORIES, fid)
+    if f:
+        f.unlink(missing_ok=True)
     return {"ok": True}
+
+
+@app.post("/api/library/clear")
+async def api_lib_clear(body: dict = Body(default={})):
+    """Empty the saved library. ``kind`` = 'plans' | 'stories' | 'all' (default);
+    optional ``brand`` limits the wipe to one brand's subfolder."""
+    import shutil
+    kind  = body.get("kind", "all")
+    brand = _slug_id(body.get("brand", "")) if body.get("brand") else ""
+    folders = {"plans": [LIB_PLANS], "stories": [LIB_STORIES],
+               "all": [LIB_PLANS, LIB_STORIES]}.get(kind, [LIB_PLANS, LIB_STORIES])
+    removed = 0
+    for folder in folders:
+        targets = [folder / brand] if brand else [folder]
+        for t in targets:
+            for f in t.rglob("*.json") if t.exists() else []:
+                try:
+                    f.unlink(); removed += 1
+                except OSError:
+                    pass
+            # Drop now-empty brand subfolders, but keep the top-level folder.
+            if brand and (folder / brand).exists():
+                shutil.rmtree(folder / brand, ignore_errors=True)
+    return {"ok": True, "removed": removed}
 
 
 def _slug_id(fid: str) -> str:
@@ -507,10 +614,12 @@ async def api_fetch_stories(
     _acquire("fetch stories")
     t0 = time.time()
     try:
-        ranked = await _run(_sync_fetch_stories, limit, top, category or None, model or None)
+        exclude = set(_session.get("used_urls") or ())
+        ranked = await _run(_sync_fetch_stories, limit, top, category or None,
+                            model or None, exclude)
         _session["stories"] = ranked
         elapsed = round(time.time() - t0, 1)
-        return {"stories": ranked, "elapsed": elapsed}
+        return {"stories": ranked, "elapsed": elapsed, "excluded": len(exclude)}
     except HTTPException:
         raise
     except Exception as e:
@@ -525,13 +634,15 @@ async def api_generate_plan(body: dict = Body(...)):
     story       = body.get("story", {})
     total       = body.get("total_slides") or None
     model       = body.get("model") or None
+    tone        = body.get("tone", "")
     _apply_brand(body.get("brand"))
     _acquire("generate plan")
     t0 = time.time()
     try:
-        plan = await _run(_sync_generate_plan, story, total, model)
+        plan = await _run(_sync_generate_plan, story, total, model, tone)
         _session["plan"]        = plan
         _session["image_paths"] = {}
+        _mark_used(story.get("url"))
         elapsed = round(time.time() - t0, 1)
         return {"plan": plan, "elapsed": elapsed}
     except HTTPException:
@@ -626,15 +737,31 @@ async def api_swap_image(slide_idx: int, body: dict = Body(...)):
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/images/search")
+async def api_search_images(body: dict = Body(...)):
+    """Return a grid of candidate images for a query so the user can pick one."""
+    query  = body.get("query", "")
+    source = body.get("source", "pexels")
+    count  = int(body.get("count", 10))
+    if not query:
+        raise HTTPException(400, "query required")
+    try:
+        results = await _run(_sync_search_images, query, source, count)
+        return {"results": results, "source": source}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.post("/api/images/from-url")
 async def api_image_from_url(body: dict = Body(...)):
     url   = body.get("url", "")
     name  = body.get("name", "")
     sidx  = body.get("slide_idx")
+    do_filter = body.get("filter", True)   # bake the slight filter into web images
     if not url:
         raise HTTPException(400, "url required")
     try:
-        path = await _run(_sync_fetch_url, url, name or None)
+        path = await _run(_sync_fetch_url, url, name or None, do_filter)
         if sidx is not None:
             _session["image_paths"][str(sidx)] = path
         return {"path": path, "filename": Path(path).name}
@@ -696,9 +823,11 @@ async def api_render(body: dict = Body(default={})):
     if not plan:
         raise HTTPException(400, "No plan loaded.")
     _apply_brand(body.get("brand"))
+    save = body.get("save", True)
     t0 = time.time()
     try:
-        out_dir = await _run(_sync_render_carousel, plan, _session.get("image_paths", {}))
+        out_dir = await _run(_sync_render_carousel, plan,
+                             _session.get("image_paths", {}), save)
         _session["rendered_dir"] = out_dir
         elapsed = round(time.time() - t0, 1)
         files   = sorted(Path(out_dir).glob("*.png"))
@@ -706,6 +835,7 @@ async def api_render(body: dict = Body(default={})):
         return {
             "output_dir": out_dir,
             "rel":        rel,
+            "saved":      save,
             "files":      [f.name for f in files],
             "elapsed":    elapsed,
         }
@@ -960,6 +1090,7 @@ nav{display:flex;gap:3px;margin-left:16px;}
 <div id="tab-stories" class="tab active">
   <div class="stories-toolbar">
     <button class="btn btn-primary" onclick="fetchStories()" id="btn-fetch">Fetch &amp; Score</button>
+    <button class="btn btn-ghost btn-sm" onclick="resetUsed()" id="btn-reset-used" title="Allow already-generated stories to be served again">↺ Reset seen</button>
     <button class="btn btn-danger btn-sm" id="btn-cancel" style="display:none;" onclick="cancelJob()">⨯ Cancel</button>
     <div class="cat-tabs" id="cat-tabs">
       <button class="cat-btn active" onclick="selectCat('',this)">All</button>
@@ -982,7 +1113,16 @@ nav{display:flex;gap:3px;margin-left:16px;}
     <div style="flex:1"></div>
     <span style="font-size:11px;color:var(--muted);">Apply formats to selected:</span>
     <div id="bulk-fmt-chips" style="display:flex;gap:4px;"></div>
-    <select id="batch-src" class="src-sel"><option value="pexels">Pexels</option><option value="unsplash">Unsplash</option></select>
+    <select id="tone-sel" class="src-sel" title="Stance applied to generated copy">
+      <option value="">Tone: Auto</option>
+      <option value="positive, upbeat">Positive</option>
+      <option value="negative, critical">Negative</option>
+      <option value="neutral, factual">Neutral</option>
+      <option value="hyped, exciting">Hype</option>
+      <option value="analytical, measured">Analytical</option>
+      <option value="skeptical, cautionary">Skeptical</option>
+    </select>
+    <select id="batch-src" class="src-sel"><option value="pexels">Pexels</option><option value="unsplash">Unsplash</option><option value="google">Google</option></select>
     <button class="btn btn-green" onclick="runBatch()" id="btn-batch">Generate All Selected</button>
     <button class="btn btn-danger btn-sm" id="btn-cancel-batch" style="display:none;" onclick="cancelJob()">⨯ Cancel</button>
   </div>
@@ -1034,6 +1174,7 @@ nav{display:flex;gap:3px;margin-left:16px;}
       <select id="img-source" class="src-sel">
         <option value="pexels">Pexels</option>
         <option value="unsplash">Unsplash</option>
+        <option value="google">Google</option>
       </select>
       <button class="btn btn-ghost btn-sm" onclick="fetchImages()" id="btn-fetch-img">Fetch Images</button>
       <button class="btn btn-danger btn-sm" onclick="clearImageCache()" title="Delete all cached background images">🗑 Cache</button>
@@ -1436,7 +1577,8 @@ async function fetchStories() {
     S.stories = data.stories;
     renderStoriesList(data.stories);
     const cancelNote = S.cancelRequested ? ' · cancelled' : '';
-    status.innerHTML = `<span class="badge badge-ok">${data.stories.length} ranked · ${data.elapsed}s${cancelNote}</span>`;
+    const skipNote = data.excluded ? ` · ${data.excluded} already used` : '';
+    status.innerHTML = `<span class="badge badge-ok">${data.stories.length} ranked · ${data.elapsed}s${skipNote}${cancelNote}</span>`;
     document.getElementById('hdr-timer').textContent = data.elapsed+'s';
     notify(S.cancelRequested ? 'Fetch cancelled' : 'Fetch & Score complete',
            `${data.stories.length} ${curBrand()||''} stories ranked in ${data.elapsed}s`);
@@ -1449,6 +1591,13 @@ async function fetchStories() {
     if(cancelBtn) cancelBtn.style.display='none';
     btn.disabled = false; btn.innerHTML = 'Fetch &amp; Score';
   }
+}
+
+async function resetUsed() {
+  try {
+    const r = await api('/api/session/reset','POST',{});
+    toast(r.cleared ? `Reset — ${r.cleared} story(ies) can appear again` : 'Nothing to reset');
+  } catch(e){ toast(e.message,'err'); }
 }
 
 function renderStoriesList(stories) {
@@ -1528,7 +1677,8 @@ async function runBatch() {
   try {
     const model = document.getElementById('model-sel').value;
     const source = document.getElementById('batch-src').value;
-    const data = await api('/api/batch/run','POST',{items,model,source,brand:curBrand()});
+    const tone = document.getElementById('tone-sel')?.value || '';
+    const data = await api('/api/batch/run','POST',{items,model,source,tone,brand:curBrand()});
     document.getElementById('hdr-timer').textContent = data.elapsed+'s';
     showBatchResults(data);
     const ok = data.results.filter(r=>r.ok).length;
@@ -1608,8 +1758,9 @@ async function retryBatchItem(ri) {
     const model  = document.getElementById('model-sel').value;
     const source = document.getElementById('batch-src').value;
     const total  = parseInt(document.getElementById('slide-count-sel')?.value || '4');
+    const tone   = document.getElementById('tone-sel')?.value || '';
     const data = await api('/api/batch/run','POST',{
-      items:[{story:r.story, formats:[r.format], total_slides:total}], model, source, brand:curBrand(),
+      items:[{story:r.story, formats:[r.format], total_slides:total, tone}], model, source, brand:curBrand(),
     });
     const nr = (data.results||[])[0];
     if (nr) { S.batch[ri] = nr; showBatchResults({results:S.batch, batch_dir:data.batch_dir}); }
@@ -1624,6 +1775,7 @@ async function useStor(i) {
   document.getElementById('sc-'+i)?.classList.add('selected');
   const model  = document.getElementById('model-sel').value;
   const total  = parseInt(document.getElementById('slide-count-sel').value);
+  const tone   = document.getElementById('tone-sel')?.value || '';
   toast('Generating plan…');
   S.busy = 'generate plan';
   const t0 = Date.now();
@@ -1635,6 +1787,7 @@ async function useStor(i) {
       story: {title:s.title,summary:s.summary,url:s.url,published:s.published||''},
       total_slides: total,
       model,
+      tone,
       brand: curBrand(),
     });
     document.getElementById('hdr-timer').textContent = data.elapsed+'s';
@@ -1679,8 +1832,9 @@ function renderForm(plan) {
       <div class="field-group"><label>Image Query</label>
         <div class="img-row">
           <div class="img-thumb empty" id="thumb-${i}">🖼</div>
-          <input class="url-inp" id="f-iq-${i}" value="${esc(sl.image_query||'')}" placeholder="Pexels/Unsplash search…" style="flex:1">
-          <button class="btn btn-ghost btn-sm" onclick="swapImage(${i})">Swap</button>
+          <input class="url-inp" id="f-iq-${i}" value="${esc(sl.image_query||'')}" placeholder="search images…" style="flex:1">
+          <button class="btn btn-ghost btn-sm" onclick="searchImagesFor(${i})" title="Search and pick from a grid">🔍 Search</button>
+          <button class="btn btn-ghost btn-sm" onclick="swapImage(${i})" title="Auto-use the top result">Swap</button>
         </div>
       </div>
       <div class="field-group"><label>Image from URL</label>
@@ -1728,7 +1882,18 @@ function renderForm(plan) {
       <div class="field-group"><label>Caption</label><textarea id="f-cap" rows="3" oninput="syncPlan()">${esc(plan.caption||'')}</textarea></div>
       <div class="field-group"><label>Hashtags (comma-separated)</label><input id="f-tags" value="${esc((plan.hashtags||[]).join(', '))}" oninput="syncPlan()"></div>
       <div class="field-group"><label>DM Keyword</label><input id="f-dm" value="${esc(plan.dm_keyword||'')}" oninput="syncPlan()"></div>
-      <div class="field-group"><label>Tone / extra direction (optional)</label><input id="f-tone" value="${esc(plan.tone||'')}" placeholder="e.g. punchy, hype, formal…" oninput="syncPlan()"></div>
+      <div class="field-group"><label>Tone / stance (optional)</label>
+        <input id="f-tone" list="tone-presets" value="${esc(plan.tone||'')}" placeholder="e.g. positive, negative, hyped, skeptical…" oninput="syncPlan()">
+        <datalist id="tone-presets">
+          <option value="positive, upbeat"></option>
+          <option value="negative, critical"></option>
+          <option value="neutral, factual"></option>
+          <option value="hyped, exciting"></option>
+          <option value="analytical, measured"></option>
+          <option value="skeptical, cautionary"></option>
+        </datalist>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px;">Saved with the post. Applies on the next ✨ caption regen; for new copy, re-generate from Stories with this tone.</div>
+      </div>
       <button class="btn btn-ghost btn-sm" onclick="regenCaption()" id="btn-regen-cap" style="align-self:flex-start;">✨ Generate caption + hashtags</button>
     </div>
   `;
@@ -1878,6 +2043,46 @@ async function imgFromUrl(idx) {
     toast(`Slide ${idx+1} image set from URL`);
     showSlidePreview(idx+1);
   } catch(e){toast(e.message,'err');}
+}
+
+// Search a source (Pexels/Unsplash/Google) and let the user pick from a grid.
+async function searchImagesFor(idx) {
+  const q = g(`f-iq-${idx}`)?.value || '';
+  if (!q) { toast('Enter a search query','err'); return; }
+  const source = g('img-source')?.value || 'pexels';
+  openModal(`Pick an image · ${source} · "${q}"`);
+  const body = g('modal-body');
+  body.innerHTML = '<div style="color:var(--muted);font-size:12px;"><span class="spin"></span> Searching…</div>';
+  try {
+    const data = await api('/api/images/search','POST',{query:q, source, count:12});
+    const results = data.results || [];
+    if (!results.length) { body.innerHTML = '<div style="color:var(--muted);font-size:12px;">No results.</div>'; return; }
+    body.innerHTML = `
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">
+        ${results.length} results${source==='google'?' · web images get a slight filter baked in':''}. Click one to use it for slide ${idx+1}.</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+        ${results.map((r,ri)=>`
+          <div style="cursor:pointer;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:#0d1828;" onclick='pickImage(${idx}, ${JSON.stringify(r.url)}, ${JSON.stringify(source)})' title="${esc(r.title||'')}">
+            <img src="${esc(r.thumb||r.url)}" style="width:100%;height:120px;object-fit:cover;display:block;" loading="lazy" onerror="this.style.opacity=.3">
+          </div>`).join('')}
+      </div>`;
+  } catch(e){ body.innerHTML = `<div style="color:var(--red);font-size:12px;">${esc(e.message)}</div>`; }
+}
+
+async function pickImage(idx, url, source) {
+  const body = g('modal-body');
+  if (body) body.innerHTML = '<div style="color:var(--muted);font-size:12px;"><span class="spin"></span> Downloading…</div>';
+  try {
+    // Web (Google) picks get the bake-in filter; curated stock stays as-is.
+    const data = await api('/api/images/from-url','POST',{
+      url, slide_idx:idx, name:`slide${idx+1}`, filter: source==='google',
+    });
+    S.imagePaths[idx] = data.path;
+    setThumb(idx,'/image_cache/'+data.filename);
+    closeModal();
+    toast(`Slide ${idx+1} image set`);
+    showSlidePreview(idx+1);
+  } catch(e){ toast(e.message,'err'); closeModal(); }
 }
 
 // Jump the preview pane to a content slide and re-render it so image changes show
@@ -2354,7 +2559,9 @@ async function openLibrary() {
   try {
     const data = await api('/api/library/plans');
     if (!data.plans.length){ body.innerHTML='<div style="color:var(--muted);font-size:12px;">No saved plans yet.</div>'; return; }
-    body.innerHTML = data.plans.map(p=>`
+    body.innerHTML = `<div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+        <button class="btn btn-danger btn-sm" onclick="clearLibrary('plans')">🗑 Clear all plans</button>
+      </div>` + data.plans.map(p=>`
       <div class="story-card" style="cursor:default;">
         <div class="s-top">
           <span class="score-pill badge badge-info">${esc(p.brand||'')}</span>
@@ -2383,6 +2590,16 @@ async function delSavedPlan(id, btn) {
   btn.closest('.story-card')?.remove();
 }
 
+async function clearLibrary(kind) {
+  const label = kind==='plans' ? 'saved plans' : 'saved story sets';
+  if (!confirm(`Delete ALL ${label}? This cannot be undone.`)) return;
+  try {
+    const r = await api('/api/library/clear','POST',{kind});
+    toast(`Cleared ${r.removed} item(s)`);
+    kind==='plans' ? openLibrary() : openStoryLibrary();
+  } catch(e){ toast(e.message,'err'); }
+}
+
 async function saveStorySet() {
   if (!S.stories.length){ toast('Fetch stories first','err'); return; }
   try { await api('/api/library/stories','POST',{}); toast('Story set saved'); }
@@ -2396,7 +2613,9 @@ async function openStoryLibrary() {
   try {
     const data = await api('/api/library/stories');
     if (!data.stories.length){ body.innerHTML='<div style="color:var(--muted);font-size:12px;">No saved sets yet.</div>'; return; }
-    body.innerHTML = data.stories.map(s=>`
+    body.innerHTML = `<div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+        <button class="btn btn-danger btn-sm" onclick="clearLibrary('stories')">🗑 Clear all sets</button>
+      </div>` + data.stories.map(s=>`
       <div class="story-card" style="cursor:default;">
         <div class="s-top">
           <span class="score-pill badge badge-info">${esc(s.brand||'')}</span>
