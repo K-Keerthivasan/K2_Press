@@ -59,7 +59,7 @@ Open `http://localhost:8000`. The compose setup maps `outputs/`, `image_cache/`,
 Add a Tailscale pre-auth key to a local `.env.tailscale` file:
 
 ```env
-TS_AUTHKEY=tskey-auth-your-key
+TS_AUTHKEY=<paste-your-tailscale-pre-auth-key-here>
 ```
 
 Then run the app with the Tailscale sidecar:

@@ -84,7 +84,7 @@ Create a Tailscale pre-auth key in the Tailscale admin console, then add it to
 `.env.tailscale`:
 
 ```env
-TS_AUTHKEY=tskey-auth-your-key
+TS_AUTHKEY=<paste-your-tailscale-pre-auth-key-here>
 ```
 
 Start the app and its Tailscale sidecar:
