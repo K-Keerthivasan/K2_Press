@@ -39,7 +39,20 @@ _session: dict[str, Any] = {
     "image_paths":  {},   # {str(slide_idx): str path}
     "rendered_dir": None,
     "used_urls":    set(),  # stories already generated this session — not re-served
+    "bulk_progress": None,  # {done,total,current,brand,running} during a bulk run
 }
+
+
+def _set_progress(done: int, total: int, current: str = "", brand: str = "",
+                  running: bool = True) -> None:
+    """Publish bulk-run progress so the UI can poll it via /api/session, and
+    heartbeat the busy lock so a long run can't trip the stale-lock expiry."""
+    _session["bulk_progress"] = {
+        "done": done, "total": total, "current": current,
+        "brand": brand, "running": running,
+    }
+    if running:
+        _busy["since"] = time.time()
 
 def _mark_used(*urls: str | None) -> None:
     """Remember stories we've generated from so a re-fetch won't surface them
@@ -53,7 +66,9 @@ def _mark_used(*urls: str | None) -> None:
 # Single-flight guard: only one heavy LLM job (fetch/plan/batch) at a time so a
 # page refresh + re-click can't stack overlapping Ollama runs.
 _busy: dict[str, Any] = {"job": None, "since": 0.0}
-_BUSY_TIMEOUT = 600  # seconds; stale lock auto-expires so we can never deadlock
+# Long enough for a big (25–50 post) cross-brand bulk run. The job heartbeats
+# `_busy["since"]` per item so the stale-lock expiry can't trip mid-run.
+_BUSY_TIMEOUT = 3600  # seconds; stale lock auto-expires so we can never deadlock
 _cancel: dict[str, bool] = {"flag": False}  # cooperative cancel for loop jobs
 
 
@@ -93,12 +108,28 @@ def _sync_list_models():
     return list_models()
 
 
-def _sync_fetch_stories(limit, top_n, category, model, exclude=()):
+# Sentinel category that pulls from Google Trends instead of the RSS feeds.
+TRENDING_CAT = "__trending__"
+
+
+def _sync_fetch_stories(limit, top_n, category, model, exclude=(), brand_key=None):
     from feeds import fetch_stories, configured_feed_urls, load_config
     from filter import rank_stories
-    from brands import resolve_brand, brand_feeds_config
+    from brands import resolve_brand, brand_feeds_config, active_key
     config = load_config()
-    brand  = resolve_brand(config)
+    # Resolve the brand explicitly from the per-request key so the worker is immune
+    # to the global active-brand being flipped by a concurrent request (otherwise a
+    # second column's fetch could make this one return the wrong brand's stories).
+    bkey   = brand_key or active_key(config)
+    brand  = resolve_brand(config, bkey)
+
+    # 🔥 Trending: skip RSS + LLM ranking; Google already ranks these.
+    if category == TRENDING_CAT:
+        from trends import trending_stories
+        stories = trending_stories(bkey, count=max(top_n, limit))
+        stories = [s for s in stories if s["url"] not in exclude]
+        return stories[:max(top_n, 1)] if top_n else stories
+
     scoped = brand_feeds_config(config, brand)
     urls = configured_feed_urls(scoped, category=category or None)
     if not urls:
@@ -190,6 +221,13 @@ def _sync_preview_slide(template, variables):
     return render_slide_to_bytes(template, variables)
 
 
+def _sync_preview_fmt(template, variables, width, height):
+    """Preview render at an explicit canvas size (single-card formats vary:
+    square 1080², linkedin 1200², x 1600×900)."""
+    from render import render_slide_to_bytes
+    return render_slide_to_bytes(template, variables, width, height)
+
+
 def _base_vars(plan):
     from render import _base_vars as rbv
     return rbv(plan)
@@ -232,21 +270,77 @@ EDITABLE_FILES = {
     "square.html":       Path("templates/square.html"),
     "story.html":        Path("templates/story.html"),
     "xpost.html":        Path("templates/xpost.html"),
+    "quote.html":        Path("templates/quote.html"),
+    "comparison.html":   Path("templates/comparison.html"),
+    "breaking.html":     Path("templates/breaking.html"),
+    "linkedin.html":     Path("templates/linkedin.html"),
+    "listicle_content.html": Path("templates/listicle_content.html"),
     "brand.css":         Path("static/brand.css"),
 }
 
 
-def _sync_batch_run(items, model, source, save=True, tone=""):
-    """Plan + fetch images + render every (story, format) pair.
+def _fmt_allowed(fmt: str, brand_key: str, config: dict) -> bool:
+    """A format may restrict itself to certain brands (e.g. LinkedIn -> K2 only)
+    via formats.<fmt>.brands in config.yaml. No list = available everywhere."""
+    allowed = (config.get("formats", {}).get(fmt, {}) or {}).get("brands")
+    return (not allowed) or (brand_key in allowed)
 
-    Output lands in outputs/<brand>/ (or a throwaway outputs/_tmp/<brand> when
-    save is False). ``tone`` is the run-level stance; an item may override it
-    with its own ``tone`` key.
-    """
+
+def _render_item(story_dict, fmt, *, config, brand, brand_key, out_root,
+                 model, source, total_slides, tone):
+    """Plan + fetch images + render ONE (story, format) pair for a given brand.
+
+    Returns a result dict (ok True/False). Shared by the single-brand batch and
+    the cross-brand bulk runs so both honour brand_key + format restrictions."""
     from feeds import Story
     from plan import plan_post
     from images import fetch_images_for_plan, fetch_image
-    from render import generate_post
+    from render import generate_post, CAROUSEL_FORMATS
+
+    story = Story(**story_dict)
+    if not _fmt_allowed(fmt, brand_key, config):
+        return {"title": story.title, "format": fmt, "brand": brand_key,
+                "ok": False, "skipped": True,
+                "error": f"'{fmt}' is not available for {brand.get('name', brand_key)}"}
+    try:
+        plan = plan_post(story, fmt, config=config, total_slides=total_slides,
+                         model=model, brand=brand, tone=tone)
+        # Multi-image (carousel/listicle) vs single-card image fetch.
+        if fmt in CAROUSEL_FORMATS:
+            img_paths = fetch_images_for_plan(plan, source=source)
+        else:
+            img_paths = None
+            q = plan.get("image_query")
+            if q:
+                try:
+                    img_paths = {0: fetch_image(q, source)}
+                except Exception as ie:
+                    print(f"[bulk] image fail '{q}': {ie}")
+                    img_paths = None
+        out_dir = generate_post(plan, fmt, img_paths, out_root=out_root,
+                                brand_key=brand_key)
+        files   = sorted(p.name for p in Path(out_dir).glob("*.png"))
+        return {
+            "title":       story.title,
+            "format":      fmt,
+            "brand":       brand_key,
+            "slug":        plan.get("slug", ""),
+            "rel":         Path(out_dir).relative_to("outputs").as_posix(),
+            "files":       files,
+            "caption":     plan.get("caption", ""),
+            "image_query": plan.get("image_query", ""),
+            "plan":        plan,
+            "story":       story_dict,
+            "ok":          True,
+        }
+    except Exception as e:
+        return {"title": story.title, "format": fmt, "brand": brand_key,
+                "story": story_dict, "ok": False, "error": str(e)}
+
+
+def _sync_batch_run(items, model, source, save=True, tone=""):
+    """Single-brand batch: plan + fetch images + render every (story, format)
+    pair for the active brand. Output lands in outputs/<brand>/ (or _tmp)."""
     from brands import resolve_brand, active_key
 
     config    = _cfg()
@@ -256,52 +350,97 @@ def _sync_batch_run(items, model, source, save=True, tone=""):
         _clear_tmp()
     out_root  = _out_root_for(brand_key, save)
     results   = []
+    total     = sum(len(it.get("formats", ["carousel"])) for it in items)
+    done      = 0
+    _set_progress(0, total, brand=brand_key)
 
     cancelled = False
     for item in items:
         if _cancelled():
             cancelled = True
             break
-        story = Story(**item["story"])
         item_tone = item.get("tone", tone)
         for fmt in item.get("formats", ["carousel"]):
             if _cancelled():
                 cancelled = True
                 break
-            try:
-                plan = plan_post(story, fmt, config=config,
-                                 total_slides=item.get("total_slides"), model=model,
-                                 brand=brand, tone=item_tone)
-                # images
-                if fmt == "carousel":
-                    img_paths = fetch_images_for_plan(plan, source=source)
-                else:
-                    img_paths = None
-                    q = plan.get("image_query")
-                    if q:
-                        try:
-                            img_paths = {0: fetch_image(q, source)}
-                        except Exception as ie:
-                            print(f"[batch] image fail '{q}': {ie}")
-                            img_paths = None
-                out_dir = generate_post(plan, fmt, img_paths, out_root=out_root)
-                files   = sorted(p.name for p in Path(out_dir).glob("*.png"))
-                results.append({
-                    "title":   story.title,
-                    "format":  fmt,
-                    "slug":    plan.get("slug", ""),
-                    "rel":     Path(out_dir).relative_to("outputs").as_posix(),
-                    "files":   files,
-                    "caption": plan.get("caption", ""),
-                    "plan":    plan,
-                    "story":   item["story"],
-                    "ok":      True,
-                })
-            except Exception as e:
-                results.append({"title": story.title, "format": fmt, "ok": False, "error": str(e)})
+            _set_progress(done, total, current=(item.get("story") or {}).get("title", ""),
+                          brand=brand_key)
+            results.append(_render_item(
+                item["story"], fmt, config=config, brand=brand, brand_key=brand_key,
+                out_root=out_root, model=model, source=source,
+                total_slides=item.get("total_slides"), tone=item_tone))
+            done += 1
 
+    _set_progress(done, total, brand=brand_key, running=False)
     return {"batch_dir": out_root.as_posix(), "saved": save,
             "results": results, "cancelled": cancelled}
+
+
+def _sync_bulk_run(groups, model, source, save=True, tone=""):
+    """Cross-brand bulk run. ``groups`` = [{brand, items:[{story,formats,
+    total_slides,tone}]}]. Each group renders for its OWN brand via an explicit
+    brand_key, so K2 + JKR posts come out of one job with no global-brand desync.
+    Brands run sequentially (timing is not a concern for this workflow)."""
+    from brands import resolve_brand, list_brands
+
+    config = _cfg()
+    known  = list_brands(config)
+    if not save:
+        _clear_tmp()
+    results: list[dict] = []
+    total = sum(len(it.get("formats", ["carousel"]))
+                for grp in groups for it in grp.get("items", []))
+    done  = 0
+    _set_progress(0, total)
+
+    cancelled = False
+    dirs: set[str] = set()
+    for grp in groups:
+        bkey = grp.get("brand")
+        if bkey not in known:
+            continue
+        brand    = resolve_brand(config, bkey)
+        out_root = _out_root_for(bkey, save)
+        dirs.add(out_root.as_posix())
+        for item in grp.get("items", []):
+            if _cancelled():
+                cancelled = True
+                break
+            item_tone = item.get("tone", tone)
+            for fmt in item.get("formats", ["carousel"]):
+                if _cancelled():
+                    cancelled = True
+                    break
+                _set_progress(done, total,
+                              current=(item.get("story") or {}).get("title", ""),
+                              brand=bkey)
+                results.append(_render_item(
+                    item["story"], fmt, config=config, brand=brand, brand_key=bkey,
+                    out_root=out_root, model=model, source=source,
+                    total_slides=item.get("total_slides"), tone=item_tone))
+                done += 1
+            if cancelled:
+                break
+        if cancelled:
+            break
+
+    _set_progress(done, total, running=False)
+    return {"batch_dirs": sorted(dirs), "saved": save,
+            "results": results, "cancelled": cancelled}
+
+
+def _sync_rerender_one(plan, fmt, image_paths, brand_key, save=True):
+    """Re-render a single post (used after the user swaps a suggested image)."""
+    from render import generate_post
+    if not save:
+        _clear_tmp()
+    out_root  = _out_root_for(brand_key or "default", save)
+    int_paths = {int(k): (Path(v) if v else None) for k, v in (image_paths or {}).items()}
+    out_dir   = generate_post(plan, fmt, int_paths, out_root=out_root,
+                              brand_key=brand_key)
+    files = sorted(p.name for p in Path(out_dir).glob("*.png"))
+    return {"rel": Path(out_dir).relative_to("outputs").as_posix(), "files": files}
 
 
 # ── API: models ───────────────────────────────────────────────────────────────
@@ -322,7 +461,11 @@ async def api_set_model(body: dict = Body(...)):
 @app.get("/api/formats")
 async def api_formats():
     fmts = _cfg().get("formats", {})
-    return {"formats": {k: v.get("name", k) for k, v in fmts.items()}}
+    return {
+        "formats": {k: v.get("name", k) for k, v in fmts.items()},
+        # Brand restrictions so the UI can hide brand-locked formats (e.g. LinkedIn → K2).
+        "restrict": {k: v["brands"] for k, v in fmts.items() if v.get("brands")},
+    }
 
 
 # ── API: batch ───────────────────────────────────────────────────────────────
@@ -351,13 +494,63 @@ async def api_batch_run(body: dict = Body(...)):
         _release()
 
 
+# ── API: bulk (cross-brand) ────────────────────────────────────────────────────
+@app.post("/api/bulk/run")
+async def api_bulk_run(body: dict = Body(...)):
+    """Generate posts for multiple brands in one job. Body:
+    {groups:[{brand, items:[{story,formats,total_slides,tone}]}], model, source, save, tone}."""
+    groups = body.get("groups", [])
+    model  = body.get("model") or None
+    source = body.get("source", "pexels")
+    save   = body.get("save", True)
+    tone   = body.get("tone", "")
+    groups = [g for g in groups if g.get("items")]
+    if not groups:
+        raise HTTPException(400, "No stories selected for any brand.")
+    _acquire("bulk")
+    t0 = time.time()
+    try:
+        out = await _run(_sync_bulk_run, groups, model, source, save, tone)
+        out["elapsed"] = round(time.time() - t0, 1)
+        _mark_used(*[(it.get("story") or {}).get("url")
+                     for g in groups for it in g.get("items", [])])
+        return out
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        _release()
+
+
+@app.post("/api/bulk/rerender")
+async def api_bulk_rerender(body: dict = Body(...)):
+    """Re-render one post after swapping its image. Body:
+    {plan, format, brand, image_paths:{idx:path}, save?}."""
+    plan = body.get("plan")
+    fmt  = body.get("format", "carousel")
+    if not plan:
+        raise HTTPException(400, "plan required")
+    bkey = body.get("brand") or _active_brand_key()
+    save = body.get("save", True)
+    imgs = body.get("image_paths", {})
+    try:
+        out = await _run(_sync_rerender_one, plan, fmt, imgs, bkey, save)
+        return out
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 # ── API: categories ───────────────────────────────────────────────────────────
 @app.get("/api/categories")
-async def api_categories():
+async def api_categories(brand: str = ""):
+    """Categories for a brand. ``brand`` resolves explicitly (no global switch),
+    so the bulk tab can read each brand's feeds without changing the active one."""
     from feeds import list_categories, load_config
     from brands import resolve_brand, brand_feeds_config
     config = load_config()
-    scoped = brand_feeds_config(config, resolve_brand(config))
+    b = resolve_brand(config, brand or None)
+    scoped = brand_feeds_config(config, b)
     return {"categories": list_categories(scoped)}
 
 
@@ -414,6 +607,16 @@ async def api_brand():
         "navy":    t.get("navy", "#0A0F1E"),
         "text":    t.get("text", "#FFFFFF"),
     }
+
+
+@app.get("/api/brand-logo")
+async def api_brand_logo(brand: str = ""):
+    """Redirect to a specific brand's logo static URL (used by the bulk tab to
+    show each brand's mark without switching the active brand)."""
+    from fastapi.responses import RedirectResponse
+    from brands import resolve_brand
+    b = resolve_brand(_cfg(), brand or None)
+    return RedirectResponse("/" + b.get("logo_path", "static/logo.png"))
 
 
 @app.put("/api/brand")
@@ -610,13 +813,16 @@ async def api_fetch_stories(
     model:    str = "",
     brand:    str = "",
 ):
-    _apply_brand(brand)
+    # Resolve per-request (no global switch) so two columns fetching different
+    # brands in the bulk tab can't clobber each other's active brand mid-flight.
+    from brands import list_brands
+    bkey = brand if brand and brand in list_brands(_cfg()) else None
     _acquire("fetch stories")
     t0 = time.time()
     try:
         exclude = set(_session.get("used_urls") or ())
         ranked = await _run(_sync_fetch_stories, limit, top, category or None,
-                            model or None, exclude)
+                            model or None, exclude, bkey)
         _session["stories"] = ranked
         elapsed = round(time.time() - t0, 1)
         return {"stories": ranked, "elapsed": elapsed, "excluded": len(exclude)}
@@ -689,6 +895,7 @@ async def api_get_session():
         "stories":     _session.get("stories", []),
         "image_paths": _session.get("image_paths", {}),
         "busy":        busy,
+        "progress":    _session.get("bulk_progress"),
     }
 
 
@@ -867,20 +1074,74 @@ async def api_save_template(filename: str, body: dict = Body(...)):
     return {"ok": True}
 
 
+# Single-card template filename -> format key (so the Templates tab can preview
+# them with representative content at the format's real dimensions).
+SINGLE_TEMPLATE_FMT = {
+    "square.html": "square", "story.html": "story", "xpost.html": "x",
+    "quote.html": "quote", "comparison.html": "comparison",
+    "breaking.html": "breaking", "linkedin.html": "linkedin",
+}
+
+
+def _dummy_single_plan(fmt: str) -> dict:
+    """A filled-in single-card plan so each new template previews with real-looking
+    content instead of empty fields."""
+    p = {"slug": "preview", "format": fmt,
+         "headline": "Your Headline Goes Here",
+         "body": "— First key point\n— Second key point\n— Third key point",
+         "image_query": "city skyline", "caption": "Preview caption.",
+         "hashtags": ["preview"], "dm_keyword": "INFO"}
+    if fmt == "quote":
+        p.update({"quote": "73% of local buyers check you out online first.",
+                  "context": "If your site isn't ready, you lose them before hello.",
+                  "source_label": "via industry data"})
+    elif fmt == "comparison":
+        p.update({"headline": "DIY Website vs Pro Build",
+                  "option_a": {"label": "DIY Builder", "points": "— Cheap upfront\n— Generic templates\n— Your time sunk"},
+                  "option_b": {"label": "Pro Build", "points": "— Built to convert\n— Owned + scalable\n— You stay focused"},
+                  "verdict": "Pro pays for itself in leads."})
+    elif fmt == "breaking":
+        p.update({"banner": "HOT TAKE", "headline": "AI search is rewriting SEO",
+                  "take": "If your content isn't structured for it, you're invisible by next quarter."})
+    elif fmt == "linkedin":
+        p.update({"hook": "Most local sites fail in the first 5 seconds.",
+                  "take": "Speed and clarity beat clever design — every time.",
+                  "points": "— Load under 2s\n— One clear CTA\n— Proof above the fold",
+                  "cta": "Book a free audit"})
+    return p
+
+
 @app.post("/api/template/preview/{filename}")
 async def api_template_preview(filename: str, body: dict = Body(default={})):
+    _apply_brand(body.get("brand"))
     plan = _session.get("plan") or _dummy_plan()
-    if filename == "cover.html":
-        template  = "cover.html"
-        variables = {**_base_vars(plan), "category": body.get("category", "")}
-    else:
-        idx_map = {"title.html": 0, "brand.css": 0,
-                   "content.html": 1,
-                   "outro.html": 1 + len(plan.get("content_slides", []))}
-        idx = idx_map.get(filename, 0)
-        template, variables = _slide_vars(plan, idx)
     try:
-        png = await _run(_sync_preview_slide, template, variables)
+        if filename == "cover.html":
+            template  = "cover.html"
+            variables = {**_base_vars(plan), "category": body.get("category", "")}
+            png = await _run(_sync_preview_slide, template, variables)
+        elif filename in SINGLE_TEMPLATE_FMT:
+            from render import format_config
+            fmt   = SINGLE_TEMPLATE_FMT[filename]
+            dplan = _dummy_single_plan(fmt)
+            fc    = format_config(fmt)
+            variables = {**_base_vars(dplan), "post": dplan, "background_image": None}
+            png = await _run(_sync_preview_fmt, filename, variables,
+                             fc.get("width", 1080), fc.get("height", 1080))
+        elif filename == "listicle_content.html":
+            slide = {"rank": 3, "heading": "THE THIRD PICK",
+                     "body": "— Why it earns the spot\n— What makes it stand out",
+                     "image_query": "spotlight"}
+            variables = {**_base_vars(_dummy_plan()), "slide": slide,
+                         "slide_number": 3, "background_image": None}
+            png = await _run(_sync_preview_slide, filename, variables)
+        else:
+            idx_map = {"title.html": 0, "brand.css": 0,
+                       "content.html": 1,
+                       "outro.html": 1 + len(plan.get("content_slides", []))}
+            idx = idx_map.get(filename, 0)
+            template, variables = _slide_vars(plan, idx)
+            png = await _run(_sync_preview_slide, template, variables)
         return Response(content=png, media_type="image/png")
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -920,6 +1181,7 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>K2 Digital Media</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
@@ -933,9 +1195,16 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
 @font-face{font-family:'Roboto Mono';font-weight:700;font-display:swap;src:url('/static/fonts/RobotoMono-700.woff2') format('woff2');}
 :root{--navy:#0A0F1E;--teal:#00B4C8;--green:#00C896;--panel:#111827;--border:#1e2a3a;--text:#e4e8f0;--muted:#6b7a96;--red:#e05252;--yellow:#f5c542;}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:Calibri,Arial,sans-serif;background:var(--navy);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden;font-size:15px;}
+html{height:100%;-webkit-text-size-adjust:100%;}
+body{font-family:Calibri,Arial,sans-serif;background:var(--navy);color:var(--text);height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden;font-size:15px;}
 /* Header */
 header{display:flex;align-items:center;gap:16px;padding:0 20px;height:52px;background:var(--panel);border-bottom:1px solid var(--border);flex-shrink:0;}
+/* Mobile hamburger + slide-in drawer. On desktop the drawer is just an inline
+   flex row holding nav + the right-hand controls; the hamburger/overlay hide. */
+.hamburger{display:none;background:none;border:none;color:#fff;font-size:22px;line-height:1;cursor:pointer;padding:4px 8px;border-radius:8px;}
+.hamburger:hover{background:var(--border);}
+.nav-drawer{display:flex;align-items:center;flex:1;gap:16px;min-width:0;}
+.nav-overlay{display:none;}
 .logo{display:flex;align-items:center;gap:10px;}
 .logo img{width:34px;height:34px;border-radius:50%;}
 .logo-text{font-size:17px;font-weight:900;color:#fff;letter-spacing:-0.3px;}
@@ -954,11 +1223,26 @@ nav{display:flex;gap:3px;margin-left:16px;}
 /* ═══ STORIES TAB ══════════════════════════════════════════════════════════ */
 #tab-stories{flex-direction:column;}
 .stories-toolbar{display:flex;align-items:center;gap:8px;padding:12px 18px;border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;}
+/* Keep a label glued to its control so they wrap together, not as loose items. */
+.tb-group{display:inline-flex;align-items:center;gap:5px;flex-shrink:0;margin:0;}
+.tb-spacer{flex:1;}
 .cat-tabs{display:flex;gap:4px;overflow-x:auto;}
 .cat-btn{padding:4px 12px;border:1px solid var(--border);border-radius:20px;background:transparent;color:var(--muted);cursor:pointer;font-size:12px;font-family:inherit;font-weight:600;white-space:nowrap;transition:all .15s;}
 .cat-btn:hover{border-color:var(--teal);color:var(--teal);}
 .cat-btn.active{background:var(--teal);border-color:var(--teal);color:#000;}
 .stories-list{flex:1;overflow-y:auto;padding:14px 18px;display:flex;flex-direction:column;gap:8px;}
+/* Bulk tab: side-by-side brand columns */
+#tab-bulk{flex-direction:column;}
+.bulk-cols{flex:1;display:flex;gap:14px;overflow-y:auto;padding:14px 18px;align-items:flex-start;}
+.bulk-col{flex:1;min-width:0;background:var(--panel);border:1px solid var(--border);border-radius:10px;display:flex;flex-direction:column;max-height:100%;}
+.bulk-col-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--border);}
+.bulk-col-head img{height:26px;width:auto;max-width:80px;object-fit:contain;border-radius:5px;}
+.bulk-fmts{display:flex;flex-wrap:wrap;gap:5px;padding:10px 14px;border-bottom:1px solid var(--border);}
+.bulk-list{overflow-y:auto;padding:10px 12px;display:flex;flex-direction:column;gap:7px;min-height:60px;}
+#bulk-results{overflow-y:auto;}
+.bulk-item{background:#0d1828;border:1px solid var(--border);border-radius:8px;padding:9px 11px;font-size:12px;display:flex;gap:8px;align-items:flex-start;}
+.bulk-item .bt{color:#fff;line-height:1.35;}
+.bulk-item .bs{font-size:10px;color:var(--muted);}
 .story-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 18px;cursor:pointer;transition:border-color .15s;}
 .story-card:hover{border-color:var(--teal);}
 .story-card.selected{border-color:var(--teal);background:#0d1e2e;}
@@ -1006,6 +1290,7 @@ nav{display:flex;gap:3px;margin-left:16px;}
 .canvas-toolbar{display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;}
 .canvas-area{flex:1;display:flex;align-items:center;justify-content:center;background:#060a13;overflow:hidden;padding:20px;}
 .canvas-wrap{position:relative;border:1px solid var(--border);box-shadow:0 8px 32px rgba(0,0,0,.6);}
+.canvas-wrap .canvas-container{max-width:100%;}
 .canvas-right{width:210px;flex-shrink:0;border-left:1px solid var(--border);display:flex;flex-direction:column;overflow-y:auto;padding:14px 12px;gap:12px;}
 .canvas-right h4{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px;}
 .prop-row{display:flex;flex-direction:column;gap:4px;}
@@ -1054,34 +1339,409 @@ nav{display:flex;gap:3px;margin-left:16px;}
 #toast.err{background:var(--red);color:#fff;}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;}
 @keyframes spin{to{transform:rotate(360deg)}}
+/* Settings form rows */
+.set-row{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+.set-label{flex:1 1 180px;min-width:0;font-size:13px;color:#fff;display:flex;flex-direction:column;gap:2px;}
+.set-hint{font-size:11px;color:var(--muted);font-weight:400;}
+.set-control{flex:1 1 200px;min-width:0;}
 ::-webkit-scrollbar{width:5px;height:5px;}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}
+
+@media (max-width: 900px){
+  body{overflow:hidden;font-size:14px;}
+  header{
+    height:52px;
+    padding:8px 12px;
+    gap:10px;
+    align-items:center;
+  }
+  .hamburger{display:flex;align-items:center;justify-content:center;width:40px;height:40px;flex:0 0 auto;}
+  .logo{min-width:0;flex:1 1 auto;}
+  .logo img{width:30px;height:30px;}
+  .logo-text{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .logo-text span{display:none;}
+
+  /* Dim backdrop behind the open drawer; tap to close. */
+  .nav-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:40;}
+  body:not(.nav-open) .nav-overlay{display:none;}
+  body.nav-open .nav-overlay{display:block;}
+
+  /* The drawer: off-screen by default, slides in when body.nav-open. */
+  .nav-drawer{
+    position:fixed;top:0;left:0;bottom:0;
+    width:82%;max-width:320px;
+    flex:none;
+    flex-direction:column;align-items:stretch;justify-content:flex-start;
+    gap:6px;padding:14px;
+    background:var(--panel);border-right:1px solid var(--border);
+    box-shadow:2px 0 18px rgba(0,0,0,.4);
+    transform:translateX(-100%);transition:transform .25s ease;
+    z-index:50;overflow-y:auto;-webkit-overflow-scrolling:touch;
+  }
+  body.nav-open .nav-drawer{transform:translateX(0);}
+
+  .nav-drawer nav{flex-direction:column;width:100%;margin:0;gap:6px;overflow:visible;}
+  .nav-drawer .nav-btn{
+    width:100%;justify-content:flex-start;text-align:left;
+    min-height:46px;padding:10px 14px;font-size:15px;border-radius:9px;
+  }
+  .nav-drawer .header-right{
+    flex-direction:column;align-items:stretch;
+    margin:14px 0 0;gap:9px;min-width:0;
+    border-top:1px solid var(--border);padding-top:14px;
+  }
+  .nav-drawer .header-right label{display:block;font-size:11px;color:var(--muted);}
+  .nav-drawer .timer{display:none;}
+  .nav-drawer .model-sel,.nav-drawer .src-sel{width:100%;max-width:none;min-height:42px;font-size:14px;}
+  .src-sel{min-height:34px;max-width:132px;font-size:12px;}
+  .main{
+    overflow:hidden;
+    min-height:0;
+  }
+  .tab.active{
+    overflow-y:auto;
+    min-height:0;
+    -webkit-overflow-scrolling:touch;
+  }
+  .stories-toolbar{
+    position:sticky;
+    top:0;
+    z-index:8;
+    padding:10px;
+    gap:7px;
+    background:var(--navy);
+    align-items:stretch;
+  }
+  .stories-toolbar > .btn,
+  .stories-toolbar > select,
+  .stories-toolbar > input,
+  .stories-toolbar > .src-sel{
+    min-height:36px;
+  }
+  .tb-group > .src-sel,
+  .tb-group > select,
+  .tb-group > input{min-height:36px;}
+  /* Bulk toolbar: stack into clean full-width rows instead of a wrapped jumble. */
+  .bulk-toolbar{flex-direction:column;align-items:stretch;}
+  .bulk-toolbar .tb-spacer{display:none;}
+  .bulk-toolbar .tb-hint{display:none;}
+  .bulk-toolbar .tb-group{display:flex;justify-content:space-between;}
+  .bulk-toolbar .tb-group > .src-sel{flex:1;max-width:none;margin-left:8px;}
+  .bulk-toolbar #btn-bulk-run{width:100%;}
+  .cat-tabs{
+    order:10;
+    width:100%;
+    padding-bottom:2px;
+  }
+  .cat-btn{
+    min-height:32px;
+    padding:6px 12px;
+  }
+  .stories-list{
+    padding:10px;
+    gap:10px;
+  }
+  .story-card{
+    padding:12px;
+    border-radius:8px;
+  }
+  .s-top{
+    align-items:flex-start;
+    flex-wrap:wrap;
+  }
+  .story-title{
+    flex:1 1 220px;
+    min-width:0;
+    overflow-wrap:anywhere;
+  }
+  .story-actions{
+    flex-wrap:wrap;
+  }
+  .btn{
+    min-height:34px;
+    justify-content:center;
+    white-space:nowrap;
+  }
+  .btn-sm{min-height:32px;}
+
+  #tab-bulk{overflow-y:auto;}
+  .bulk-cols{
+    flex:none;
+    flex-direction:column;
+    overflow:visible;
+    padding:10px;
+    gap:10px;
+  }
+  .bulk-col{
+    width:100%;
+    max-height:none;
+  }
+  .bulk-col-head{
+    padding:10px;
+    gap:7px;
+  }
+  .bulk-col-head select{
+    flex:1 1 160px;
+    min-width:0;
+  }
+  .bulk-list{
+    max-height:none;
+  }
+  .bulk-item{
+    padding:10px;
+  }
+  #bulk-results{
+    overflow:visible;
+    padding-bottom:12px;
+  }
+
+  #tab-editor,
+  #tab-canvas,
+  #tab-templates{
+    flex-direction:column;
+    overflow-y:auto;
+  }
+  .editor-left,
+  .editor-right,
+  .canvas-left,
+  .canvas-center,
+  .canvas-right,
+  .tmpl-left,
+  .tmpl-right,
+  .tmpl-preview-pane{
+    width:100%;
+    flex:0 0 auto;
+    border-left:none;
+    border-right:none;
+  }
+  .editor-left{
+    border-bottom:1px solid var(--border);
+    max-height:none;
+  }
+  .editor-right{
+    min-height:70vh;
+  }
+  .panel-header{
+    padding:9px 10px;
+    gap:7px;
+    flex-wrap:wrap;
+  }
+  .panel-header h3{
+    flex:1 1 140px;
+  }
+  .plan-form{
+    padding:10px;
+    gap:10px;
+    overflow:visible;
+  }
+  .slide-sec{
+    padding:10px;
+  }
+  .field-group input,
+  .field-group textarea,
+  .field-group select,
+  .url-inp,
+  .prop-inp{
+    min-height:36px;
+    font-size:14px;
+  }
+  .img-row,
+  .url-row{
+    flex-wrap:wrap;
+  }
+  .img-row .url-inp,
+  .url-row .url-inp{
+    flex-basis:100%;
+  }
+  .preview-wrap{
+    min-height:calc(100vh - 210px);
+    min-height:calc(100dvh - 210px);
+    padding:10px;
+  }
+  .preview-wrap img{
+    max-height:calc(100vh - 230px);
+    max-height:calc(100dvh - 230px);
+  }
+
+  .canvas-left{
+    order:2;
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(148px,1fr));
+    gap:10px;
+    padding:10px;
+    border-bottom:1px solid var(--border);
+  }
+  .canvas-left .preset-btns,
+  .canvas-left [style*="flex-direction:column"]{
+    gap:6px;
+  }
+  .canvas-center{
+    order:1;
+    min-height:auto;
+  }
+  .canvas-toolbar{
+    padding:9px 10px;
+  }
+  .canvas-area{
+    min-height:calc(100vw * 1.25 + 24px);
+    max-height:none;
+    padding:10px;
+    overflow:auto;
+  }
+  .canvas-wrap{
+    width:min(100%,540px);
+    aspect-ratio:540 / 675;
+  }
+  .canvas-wrap .canvas-container,
+  .canvas-wrap canvas{
+    width:100% !important;
+    height:100% !important;
+  }
+  #overlay-canvas{
+    width:100% !important;
+    height:100% !important;
+  }
+  .canvas-right{
+    order:3;
+    display:grid;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:10px;
+    padding:10px;
+    border-top:1px solid var(--border);
+  }
+  .canvas-right h4,
+  .canvas-right hr,
+  .canvas-right > button,
+  .canvas-right .pos-grid,
+  .canvas-right .prop-row:first-of-type{
+    grid-column:1 / -1;
+  }
+
+  .tmpl-left{
+    border-bottom:1px solid var(--border);
+  }
+  .tmpl-files{
+    display:flex;
+    gap:6px;
+    overflow-x:auto;
+    padding:8px 10px;
+  }
+  .tmpl-file-btn{
+    width:auto;
+    flex:0 0 auto;
+    margin-bottom:0;
+    white-space:nowrap;
+  }
+  .tmpl-right{
+    min-height:65vh;
+  }
+  .code-area{
+    min-height:65vh;
+  }
+  .tmpl-preview-pane{
+    min-height:55vh;
+    border-top:1px solid var(--border);
+  }
+  .tmpl-preview-img-wrap{
+    min-height:48vh;
+  }
+
+  #modal-bg{
+    align-items:flex-end !important;
+    padding:10px;
+  }
+  #modal-bg > div{
+    width:100% !important;
+    max-width:100% !important;
+    max-height:88vh !important;
+    border-radius:10px !important;
+  }
+  #toast{
+    left:12px;
+    right:12px;
+    bottom:12px;
+    text-align:center;
+  }
+}
+
+@media (max-width: 560px){
+  header{
+    padding:7px 8px;
+  }
+  .stories-toolbar > .btn{
+    flex:1 1 auto;
+  }
+  #stories-status,
+  #bulk-total{
+    width:100%;
+  }
+  #bulk-fmt-chips{
+    width:100%;
+    overflow-x:auto;
+    padding-bottom:2px;
+  }
+  .panel-header > .btn,
+  .panel-header > select,
+  .panel-header > .src-sel{
+    flex:1 1 auto;
+  }
+  .preview-nav{
+    flex:1 1 100%;
+    justify-content:space-between;
+  }
+  .slide-cnt{
+    flex:1;
+  }
+  .canvas-left{
+    grid-template-columns:1fr;
+  }
+  .canvas-toolbar > .btn,
+  .canvas-toolbar > span{
+    flex:1 1 auto;
+  }
+  .canvas-area{
+    min-height:calc(100vw * 1.25 + 20px);
+  }
+  .canvas-right{
+    grid-template-columns:1fr;
+  }
+  .tmpl-right,
+  .code-area{
+    min-height:58vh;
+  }
+}
 </style>
 </head>
 <body>
 <header>
+  <button class="hamburger" id="hamburger" onclick="toggleNav()" aria-label="Menu" aria-expanded="false">☰</button>
   <div class="logo">
     <img id="hdr-logo" src="/static/logo.png" alt="brand">
     <span class="logo-text" id="hdr-brand">K2<span> Digital Media</span></span>
   </div>
-  <nav>
-    <button class="nav-btn active" onclick="showTab('stories',this)">Stories</button>
-    <button class="nav-btn"       onclick="showTab('editor',this)">Editor</button>
-    <button class="nav-btn"       onclick="showTab('canvas',this)">Canvas</button>
-    <button class="nav-btn"       onclick="showTab('templates',this)">Templates</button>
-  </nav>
-  <div class="header-right">
-    <span class="timer" id="hdr-timer"></span>
-    <button class="model-sel" id="notif-btn" onclick="toggleNotify()" title="Get a desktop notification when a task finishes" style="cursor:pointer;">🔔 Off</button>
-    <label style="font-size:11px;color:var(--muted);">Brand:</label>
-    <select class="model-sel" id="brand-sel" onchange="switchBrand(this.value)" title="Active brand / IG page">
-      <option>…</option>
-    </select>
-    <label style="font-size:11px;color:var(--muted);">Model:</label>
-    <select class="model-sel" id="model-sel" onchange="setModel(this.value)">
-      <option>Loading…</option>
-    </select>
+  <div class="nav-drawer" id="nav-drawer">
+    <nav>
+      <button class="nav-btn active" onclick="showTab('stories',this)">Stories</button>
+      <button class="nav-btn"       onclick="showTab('bulk',this)">⚡ Bulk</button>
+      <button class="nav-btn"       onclick="showTab('editor',this)">Editor</button>
+      <button class="nav-btn"       onclick="showTab('canvas',this)">Canvas</button>
+      <button class="nav-btn"       onclick="showTab('templates',this)">Templates</button>
+    </nav>
+    <div class="header-right">
+      <span class="timer" id="hdr-timer"></span>
+      <button class="model-sel" id="notif-btn" onclick="toggleNotify()" title="Get a desktop notification when a task finishes" style="cursor:pointer;">🔔 Off</button>
+      <label style="font-size:11px;color:var(--muted);">Brand:</label>
+      <select class="model-sel" id="brand-sel" onchange="switchBrand(this.value)" title="Active brand / IG page">
+        <option>…</option>
+      </select>
+      <label style="font-size:11px;color:var(--muted);">Model:</label>
+      <select class="model-sel" id="model-sel" onchange="setModel(this.value)">
+        <option>Loading…</option>
+      </select>
+      <button class="model-sel" id="settings-btn" onclick="openSettings()" title="Defaults &amp; preferences" style="cursor:pointer;">⚙ Settings</button>
+    </div>
   </div>
+  <div class="nav-overlay" id="nav-overlay" onclick="toggleNav(false)"></div>
 </header>
 
 <div class="main">
@@ -1095,10 +1755,10 @@ nav{display:flex;gap:3px;margin-left:16px;}
     <div class="cat-tabs" id="cat-tabs">
       <button class="cat-btn active" onclick="selectCat('',this)">All</button>
     </div>
-    <input type="number" id="fetch-limit" value="15" min="3" max="60" style="width:52px;background:#0d1828;border:1px solid var(--border);border-radius:5px;color:#fff;padding:4px 6px;font-size:12px;" title="stories to fetch">
-    <span style="font-size:11px;color:var(--muted);">fetch</span>
-    <input type="number" id="fetch-top" value="6" min="1" max="15" style="width:44px;background:#0d1828;border:1px solid var(--border);border-radius:5px;color:#fff;padding:4px 6px;font-size:12px;" title="top N">
-    <span style="font-size:11px;color:var(--muted);">top</span>
+    <label class="tb-group"><span style="font-size:11px;color:var(--muted);">fetch</span>
+    <input type="number" id="fetch-limit" value="15" min="3" max="60" style="width:52px;background:#0d1828;border:1px solid var(--border);border-radius:5px;color:#fff;padding:4px 6px;font-size:12px;" title="stories to fetch"></label>
+    <label class="tb-group"><span style="font-size:11px;color:var(--muted);">top</span>
+    <input type="number" id="fetch-top" value="6" min="1" max="15" style="width:44px;background:#0d1828;border:1px solid var(--border);border-radius:5px;color:#fff;padding:4px 6px;font-size:12px;" title="top N"></label>
     <button class="btn btn-ghost btn-sm" onclick="saveStorySet()" title="Save this fetched + scored set">💾 Save set</button>
     <button class="btn btn-ghost btn-sm" onclick="openStoryLibrary()" title="Load a saved set (no re-fetch)">📂 Saved</button>
     <span id="stories-status"></span>
@@ -1133,6 +1793,35 @@ nav{display:flex;gap:3px;margin-left:16px;}
       Ollama will rank stories from your configured feeds.
     </div>
   </div>
+</div>
+
+<!-- ═══════════ BULK (BOTH BRANDS) ════════════════════════════════════════ -->
+<div id="tab-bulk" class="tab">
+  <div class="stories-toolbar bulk-toolbar" style="flex-wrap:wrap;">
+    <b style="font-size:14px;color:#fff;">⚡ Bulk — all brands</b>
+    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Fetch top stories per brand, tick what you want, then generate everything in one run.</span>
+    <div class="tb-spacer"></div>
+    <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Tone</span>
+    <select id="bulk-tone" class="src-sel" title="Stance applied to all generated copy">
+      <option value="">Auto</option>
+      <option value="positive, upbeat">Positive</option>
+      <option value="negative, critical">Negative</option>
+      <option value="neutral, factual">Neutral</option>
+      <option value="hyped, exciting">Hype</option>
+      <option value="analytical, measured">Analytical</option>
+      <option value="skeptical, cautionary">Skeptical</option>
+    </select></label>
+    <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Images</span>
+    <select id="bulk-src" class="src-sel"><option value="pexels">Pexels</option><option value="unsplash">Unsplash</option><option value="google">Google</option></select></label>
+    <span id="bulk-total" style="font-size:12px;color:var(--muted);font-weight:700;">0 posts</span>
+    <button class="btn btn-green" onclick="runBulk()" id="btn-bulk-run">⚡ Generate All</button>
+    <button class="btn btn-danger btn-sm" id="btn-bulk-cancel" style="display:none;" onclick="cancelJob()">⨯ Cancel</button>
+  </div>
+  <div id="bulk-progress" style="display:none;margin:0 0 10px;"></div>
+  <div id="bulk-brands" class="bulk-cols">
+    <div style="color:var(--muted);text-align:center;padding:40px;font-size:13px;">Loading brands…</div>
+  </div>
+  <div id="bulk-results"></div>
 </div>
 
 <!-- ═══════════ EDITOR ═══════════════════════════════════════════════════ -->
@@ -1292,7 +1981,7 @@ nav{display:flex;gap:3px;margin-left:16px;}
     </div>
     <hr style="border:none;border-top:1px solid var(--border);margin:8px 0;">
     <h4>Position &amp; Size</h4>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:4px;">
+    <div class="pos-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:4px;">
       <div class="prop-row"><label>X</label><input class="prop-inp" type="number" id="prop-x" oninput="applyPos()"></div>
       <div class="prop-row"><label>Y</label><input class="prop-inp" type="number" id="prop-y" oninput="applyPos()"></div>
       <div class="prop-row"><label>W</label><input class="prop-inp" type="number" id="prop-w" oninput="applySize()"></div>
@@ -1364,7 +2053,49 @@ let S = {
   brandInfo: null,        // active brand {name,short,handle,tagline,logo,accent,navy,...}
   notify: false,          // desktop notifications enabled
   cancelRequested: false, // user asked to cancel the running loop job
+  bulk: {},               // {brandKey: {name, stories:[], sel:{}, formats:Set, count:int}}
+  results: [],            // last batch/bulk results (for ✨ Suggest / re-render)
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// User settings / defaults — persisted in localStorage, applied on every load
+// so the app boots into your preferred model / tone / image source etc.
+// ═══════════════════════════════════════════════════════════════════════════
+const SETTINGS_DEFAULTS = {
+  notify: true,           // desktop notifications ON by default
+  model: '',              // '' → keep whatever the server/first option is
+  tone: '',               // '' → Auto
+  imageSource: 'pexels',  // pexels | unsplash | google
+  slides: 4,              // default carousel slide count
+  fetchLimit: 15,         // stories to fetch per run
+  fetchTop: 6,            // top N to keep after scoring
+};
+let SETTINGS = {...SETTINGS_DEFAULTS};
+
+function loadSettings() {
+  try { SETTINGS = {...SETTINGS_DEFAULTS, ...JSON.parse(localStorage.getItem('k2_settings') || '{}')}; }
+  catch(e) { SETTINGS = {...SETTINGS_DEFAULTS}; }
+  // Migrate the old standalone notify flag the first time (before any settings save).
+  const legacy = localStorage.getItem('k2_notify');
+  if (legacy !== null && localStorage.getItem('k2_settings') === null) SETTINGS.notify = legacy === '1';
+  return SETTINGS;
+}
+function saveSettings() { localStorage.setItem('k2_settings', JSON.stringify(SETTINGS)); }
+
+// Push saved defaults onto the live controls (only when the control exists / the
+// value is a real option). Called after models/formats have loaded.
+function applySettings() {
+  const setVal = (id, v) => { const el = g(id); if (el && v != null && v !== '') el.value = v; };
+  setVal('bulk-tone',       SETTINGS.tone);
+  setVal('bulk-src',        SETTINGS.imageSource);
+  setVal('slide-count-sel', String(SETTINGS.slides));
+  setVal('fetch-limit',     String(SETTINGS.fetchLimit));
+  setVal('fetch-top',       String(SETTINGS.fetchTop));
+  const ms = g('model-sel');
+  if (ms && SETTINGS.model && [...ms.options].some(o => o.value === SETTINGS.model)) {
+    if (ms.value !== SETTINGS.model) { ms.value = SETTINGS.model; setModel(SETTINGS.model); }
+  }
+}
 
 // Ask the server to stop the running fetch/batch after the current item.
 async function cancelJob() {
@@ -1379,16 +2110,29 @@ async function cancelJob() {
 // Init
 // ═══════════════════════════════════════════════════════════════════════════
 window.addEventListener('DOMContentLoaded', async () => {
+  loadSettings();
   initNotify();
   await loadBrands();
   await Promise.all([loadModels(), loadCategories(), loadFormats()]);
+  applySettings();          // apply saved defaults now that controls/options exist
   await restoreSession();
+  refreshResponsiveSurfaces();
 });
+window.addEventListener('resize', refreshResponsiveSurfaces);
+window.addEventListener('orientationchange', () => setTimeout(refreshResponsiveSurfaces, 250));
 
 // ── Desktop notifications ────────────────────────────────────────────────────
-function initNotify() {
-  S.notify = localStorage.getItem('k2_notify')==='1'
-             && ('Notification' in window) && Notification.permission==='granted';
+// Default-on: if the saved preference wants notifications and the browser hasn't
+// decided yet, ask once on load so they "just work" without a manual toggle.
+async function initNotify() {
+  S.notify = false;
+  if (SETTINGS.notify && ('Notification' in window)) {
+    if (Notification.permission === 'granted') {
+      S.notify = true;
+    } else if (Notification.permission === 'default') {
+      try { S.notify = (await Notification.requestPermission()) === 'granted'; } catch(e) {}
+    }
+  }
   updateNotifBtn();
 }
 function updateNotifBtn() {
@@ -1398,11 +2142,11 @@ function updateNotifBtn() {
 }
 async function toggleNotify() {
   if(!('Notification' in window)) { toast('This browser has no notifications','err'); return; }
-  if(S.notify) { S.notify=false; localStorage.setItem('k2_notify','0'); updateNotifBtn(); toast('Notifications off'); return; }
+  if(S.notify) { S.notify=false; SETTINGS.notify=false; saveSettings(); updateNotifBtn(); toast('Notifications off'); return; }
   let perm = Notification.permission;
   if(perm!=='granted') perm = await Notification.requestPermission();
   if(perm==='granted') {
-    S.notify=true; localStorage.setItem('k2_notify','1'); updateNotifBtn();
+    S.notify=true; SETTINGS.notify=true; saveSettings(); updateNotifBtn();
     notify('Notifications enabled', "You'll be pinged when each task finishes.");
   } else { toast('Notification permission denied — enable it in your browser site settings','err'); }
 }
@@ -1494,6 +2238,7 @@ window.addEventListener('beforeunload', (e) => {
 async function loadFormats() {
   const data = await api('/api/formats').catch(() => ({ formats: {} }));
   S.formats = data.formats || {};
+  S.formatRestrict = data.restrict || {};   // {fmt: [allowed brand keys]}
   // bulk format chips
   const wrap = document.getElementById('bulk-fmt-chips');
   if (wrap) {
@@ -1526,7 +2271,8 @@ async function loadCategories() {
   const cats = data.categories || {};
   const tb = document.getElementById('cat-tabs');
   S.selectedCat = '';
-  tb.innerHTML = '<button class="cat-btn active" onclick="selectCat(\'\',this)">All</button>';
+  tb.innerHTML = '<button class="cat-btn active" onclick="selectCat(\'\',this)">All</button>'
+    + '<button class="cat-btn" style="color:#ff8a3d;" onclick="selectCat(\'__trending__\',this)" title="Pull from Google Trends instead of RSS">🔥 Trending</button>';
   Object.entries(cats).forEach(([k, name]) => {
     const b = document.createElement('button');
     b.className = 'cat-btn';
@@ -1538,9 +2284,23 @@ async function loadCategories() {
 
 function selectCat(key, btn) {
   S.selectedCat = key;
-  document.querySelectorAll('.cat-btn').forEach(b => b.classList.remove('active'));
+  // Scope to the category bar only — other .cat-btn (story format chips, bulk
+  // format chips) keep their own active state, which is their Set's source of truth.
+  document.querySelectorAll('#cat-tabs .cat-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mobile nav drawer (hamburger)
+// ═══════════════════════════════════════════════════════════════════════════
+function toggleNav(force) {
+  const open = (force === undefined) ? !document.body.classList.contains('nav-open') : !!force;
+  document.body.classList.toggle('nav-open', open);
+  const h = document.getElementById('hamburger');
+  if (h) h.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+// Close the drawer on Escape.
+document.addEventListener('keydown', e => { if (e.key === 'Escape') toggleNav(false); });
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tabs
@@ -1553,6 +2313,313 @@ function showTab(name, btn) {
   if (name === 'templates' && !window._cm) initCM();
   if (name === 'templates') loadTmplList();
   if (name === 'canvas' && !window._fc) initCanvas();
+  if (name === 'bulk' && !window._bulkInit) { window._bulkInit = true; initBulk(); }
+  toggleNav(false);   // collapse the mobile drawer after picking a tab
+  requestAnimationFrame(refreshResponsiveSurfaces);
+}
+
+function refreshResponsiveSurfaces() {
+  try { if (window._cm) window._cm.refresh(); } catch(e) {}
+  try {
+    if (fc) {
+      fc.calcOffset();
+      fc.requestRenderAll();
+    }
+  } catch(e) {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Bulk — generate posts for every brand in one run
+// ═══════════════════════════════════════════════════════════════════════════
+async function initBulk() {
+  let brands = {};
+  try { brands = (await api('/api/brands')).brands || {}; } catch(e){}
+  const host = g('bulk-brands');
+  host.innerHTML = '';
+  for (const [key, name] of Object.entries(brands)) {
+    S.bulk[key] = { name, stories: [], sel: {}, formats: new Set(['carousel']), count: 25 };
+    // per-brand categories (resolved without switching the active brand)
+    let cats = {};
+    try { cats = (await api('/api/categories?brand='+encodeURIComponent(key))).categories || {}; } catch(e){}
+    const catOpts = ['<option value="">All RSS feeds</option>',
+                     '<option value="__trending__">🔥 Google Trending</option>']
+      .concat(Object.entries(cats).map(([k,n])=>`<option value="${k}">${esc(n)}</option>`)).join('');
+    const restrict = S.formatRestrict || {};
+    const fmtChips = Object.entries(S.formats)
+      .filter(([fk]) => !restrict[fk] || restrict[fk].includes(key))   // hide brand-locked formats
+      .map(([fk,fn]) =>
+        `<button class="cat-btn bfmt" data-bk="${key}" data-fk="${fk}" onclick="bulkToggleFmt('${key}','${fk}',this)" style="padding:2px 9px;font-size:11px;">${esc(fn)}</button>`
+      ).join('');
+    const col = document.createElement('div');
+    col.className = 'bulk-col';
+    col.innerHTML = `
+      <div class="bulk-col-head">
+        <img src="/api/brand-logo?brand=${encodeURIComponent(key)}" onerror="this.style.display='none'" alt="">
+        <b style="color:#fff;font-size:14px;">${esc(name)}</b>
+        <div style="flex:1"></div>
+        <select class="src-sel" id="bulk-cat-${key}">${catOpts}</select>
+        <input type="number" id="bulk-count-${key}" value="25" min="1" max="60" style="width:52px;background:#0d1828;border:1px solid var(--border);border-radius:5px;color:#fff;padding:4px 6px;font-size:12px;" title="how many top stories">
+        <button class="btn btn-primary btn-sm" onclick="bulkFetch('${key}')" id="bulk-fetch-${key}">Fetch top</button>
+        <button class="btn btn-ghost btn-sm" onclick="bulkClear('${key}')" id="bulk-clear-${key}" title="Clear fetched stories" style="display:none;">✕ Clear</button>
+        <span id="bulk-status-${key}" style="font-size:11px;color:var(--muted);"></span>
+      </div>
+      <div class="bulk-fmts" id="bulk-fmts-${key}">
+        <span style="font-size:11px;color:var(--muted);align-self:center;">formats:</span>${fmtChips}
+      </div>
+      <div class="bulk-list" id="bulk-list-${key}">
+        <div style="color:var(--muted);font-size:12px;text-align:center;padding:20px;">Pick a source and click <b>Fetch top</b>.</div>
+      </div>`;
+    host.appendChild(col);
+    // reflect the default-on carousel chip
+    col.querySelectorAll(`.bfmt[data-bk="${key}"]`).forEach(b => {
+      if (S.bulk[key].formats.has(b.dataset.fk)) b.classList.add('active');
+    });
+  }
+}
+
+function bulkToggleFmt(key, fk, btn) {
+  const st = S.bulk[key]; if (!st) return;
+  if (st.formats.has(fk)) st.formats.delete(fk); else st.formats.add(fk);
+  btn.classList.toggle('active');
+  bulkUpdateTotal();
+}
+
+async function bulkFetch(key) {
+  const st = S.bulk[key]; if (!st) return;
+  const cat = g('bulk-cat-'+key).value;
+  const count = parseInt(g('bulk-count-'+key).value || '25');
+  st.count = count;
+  const btn = g('bulk-fetch-'+key); const status = g('bulk-status-'+key);
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
+  status.textContent = 'fetching…';
+  const model = g('model-sel').value;
+  try {
+    // brand= makes the server score/trend for this brand (per-request brand, no UI switch)
+    const data = await api(`/api/stories/fetch?limit=${count}&top=${count}&category=${encodeURIComponent(cat)}&model=${encodeURIComponent(model)}&brand=${encodeURIComponent(key)}`, 'POST');
+    st.stories = data.stories || [];
+    st.sel = {};
+    st.stories.forEach((_,i)=> st.sel[i] = true);  // pre-select all
+    renderBulkList(key);
+    const clr = g('bulk-clear-'+key); if (clr) clr.style.display = st.stories.length ? 'inline-flex' : 'none';
+    status.innerHTML = `<span class="badge badge-ok">${st.stories.length} ready</span>`;
+  } catch(e) {
+    status.innerHTML = `<span class="badge badge-err">${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false; btn.innerHTML = 'Fetch top';
+  }
+}
+
+// ✕ Clear a column's fetched stories back to the empty state.
+function bulkClear(key) {
+  const st = S.bulk[key]; if (!st) return;
+  st.stories = []; st.sel = {};
+  const list = g('bulk-list-'+key);
+  if (list) list.innerHTML = '<div style="color:var(--muted);font-size:12px;text-align:center;padding:20px;">Pick a source and click <b>Fetch top</b>.</div>';
+  const status = g('bulk-status-'+key); if (status) status.textContent = '';
+  const clr = g('bulk-clear-'+key); if (clr) clr.style.display = 'none';
+  bulkUpdateTotal();
+}
+
+function renderBulkList(key) {
+  const st = S.bulk[key]; const list = g('bulk-list-'+key);
+  if (!st.stories.length) { list.innerHTML = '<div style="color:var(--muted);font-size:12px;text-align:center;padding:20px;">No stories.</div>'; bulkUpdateTotal(); return; }
+  list.innerHTML = st.stories.map((s,i)=>`
+    <label class="bulk-item">
+      <input type="checkbox" ${st.sel[i]?'checked':''} onchange="bulkToggleStory('${key}',${i},this)" style="width:15px;height:15px;margin-top:2px;flex-shrink:0;">
+      <div>
+        <div class="bt">${esc(s.title)}</div>
+        <div class="bs">${s.score!=null?('score '+s.score+' · '):''}${esc((s.reason||'').slice(0,90))}</div>
+      </div>
+    </label>`).join('');
+  bulkUpdateTotal();
+}
+
+function bulkToggleStory(key, i, chk) {
+  S.bulk[key].sel[i] = chk.checked;
+  bulkUpdateTotal();
+}
+
+function bulkSelectedItems(key) {
+  const st = S.bulk[key]; if (!st) return [];
+  const fmts = [...st.formats];
+  if (!fmts.length) return [];
+  const total = parseInt(g('slide-count-sel')?.value || '4');
+  const items = [];
+  st.stories.forEach((s,i)=>{
+    if (!st.sel[i]) return;
+    items.push({ story:{title:s.title,summary:s.summary,url:s.url,published:s.published||''},
+                 formats: fmts, total_slides: total });
+  });
+  return items;
+}
+
+function bulkUpdateTotal() {
+  let posts = 0;
+  Object.keys(S.bulk).forEach(k => {
+    bulkSelectedItems(k).forEach(it => posts += it.formats.length);
+  });
+  const el = g('bulk-total'); if (el) el.textContent = posts + ' posts';
+  return posts;
+}
+
+async function runBulk() {
+  const groups = Object.keys(S.bulk)
+    .map(k => ({ brand:k, items: bulkSelectedItems(k) }))
+    .filter(g => g.items.length);
+  if (!groups.length) { toast('Select at least one story','err'); return; }
+  const totalPosts = bulkUpdateTotal();
+
+  const btn = g('btn-bulk-run');
+  btn.disabled = true; btn.innerHTML = `<span class="spin"></span> Generating ${totalPosts}…`;
+  S.busy = 'bulk'; S.cancelRequested = false;
+  const cancelBtn = g('btn-bulk-cancel'); if (cancelBtn) cancelBtn.style.display='inline-flex';
+  const prog = g('bulk-progress'); prog.style.display='block';
+  const poll = setInterval(pollBulkProgress, 700);
+  const t0 = Date.now();
+  const tid = setInterval(()=>{ g('hdr-timer').textContent = ((Date.now()-t0)/1000).toFixed(1)+'s'; },200);
+  try {
+    const model = g('model-sel').value;
+    const source = g('bulk-src').value;
+    const tone = g('bulk-tone').value || '';
+    const data = await api('/api/bulk/run','POST',{groups,model,source,tone});
+    g('hdr-timer').textContent = data.elapsed+'s';
+    showBulkResults(data);
+    const ok = data.results.filter(r=>r.ok).length;
+    const note = data.cancelled ? ' (cancelled)' : '';
+    toast(`Bulk done${note}: ${ok}/${data.results.length} posts in ${data.elapsed}s`);
+    notify(data.cancelled?'Bulk cancelled':'Bulk complete', `${ok}/${data.results.length} posts in ${data.elapsed}s`);
+  } catch(e) {
+    toast(e.message,'err'); notify('Bulk failed', e.message);
+  } finally {
+    S.busy = null; clearInterval(tid); clearInterval(poll);
+    prog.style.display='none';
+    if (cancelBtn) cancelBtn.style.display='none';
+    btn.disabled = false; btn.innerHTML = '⚡ Generate All';
+  }
+}
+
+async function pollBulkProgress() {
+  try {
+    const s = await api('/api/session');
+    const p = s.progress;
+    if (!p) return;
+    const pct = p.total ? Math.round(p.done/p.total*100) : 0;
+    g('bulk-progress').innerHTML = `
+      <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 14px;">
+        <div style="display:flex;justify-content:space-between;font-size:12px;color:#fff;margin-bottom:6px;">
+          <span>${p.done} / ${p.total} posts ${p.brand?('· '+esc(p.brand)):''}</span>
+          <span style="color:var(--muted);">${esc((p.current||'').slice(0,60))}</span>
+        </div>
+        <div style="height:7px;background:#0d1828;border-radius:4px;overflow:hidden;">
+          <div style="height:100%;width:${pct}%;background:var(--green);transition:width .3s;"></div>
+        </div>
+      </div>`;
+  } catch(e){}
+}
+
+function showBulkResults(data) {
+  S.results = data.results || [];
+  const host = g('bulk-results');
+  // group results by brand
+  const byBrand = {};
+  S.results.forEach((r,ri)=>{ (byBrand[r.brand] = byBrand[r.brand] || []).push(ri); });
+  const dirs = (data.batch_dirs||[]).join(' · ');
+  let html = `<div style="display:flex;align-items:center;gap:10px;margin:4px 18px 10px;">
+      <h3 style="font-size:15px;color:#fff;">Bulk results</h3>
+      <span class="badge badge-ok">${S.results.filter(r=>r.ok).length} ok</span>
+      ${S.results.some(r=>!r.ok)?`<span class="badge badge-err">${S.results.filter(r=>!r.ok).length} failed</span>`:''}
+      <span style="font-size:11px;color:var(--muted);">${esc(dirs)}</span>
+    </div>`;
+  Object.entries(byBrand).forEach(([bk, idxs])=>{
+    html += `<div style="margin:0 18px 6px;font-size:13px;font-weight:700;color:var(--teal);">${esc((S.bulk[bk]&&S.bulk[bk].name)||bk)}</div>
+      <div style="display:flex;flex-direction:column;gap:8px;padding:0 18px 14px;">
+      ${idxs.map(ri=>resultCard(ri)).join('')}</div>`;
+  });
+  host.innerHTML = html;
+}
+
+// Shared result-card renderer (used by single-brand batch + bulk). ri indexes S.results.
+function resultCard(ri) {
+  const r = S.results[ri];
+  if (!r.ok) return `
+    <div class="story-card" style="border-color:${r.skipped?'var(--border)':'var(--red)'};cursor:default;">
+      <div class="s-top"><span class="score-pill badge ${r.skipped?'badge-info':'badge-err'}">${esc(r.format)}${r.skipped?' skipped':' failed'}</span><span class="story-title">${esc(r.title)}</span></div>
+      <div class="story-reason" style="color:${r.skipped?'var(--muted)':'var(--red)'};">${esc(r.error||'')}</div>
+    </div>`;
+  const isCarousel = (r.format==='carousel' || r.format==='listicle');
+  return `
+    <div class="story-card" style="cursor:default;" id="rc-${ri}">
+      <div class="s-top">
+        <span class="score-pill badge badge-info">${esc(S.formats[r.format]||r.format)}</span>
+        <span class="story-title">${esc(r.title)}</span>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;" id="rc-imgs-${ri}">
+        ${r.files.map(f=>`<a href="/outputs/${r.rel}/${f}" target="_blank"><img src="/outputs/${r.rel}/${f}" style="height:120px;border-radius:5px;border:1px solid var(--border);"></a>`).join('')}
+      </div>
+      <div class="story-reason" style="white-space:pre-wrap;">${esc(r.caption||'')}</div>
+      <div class="story-actions" style="margin-top:8px;flex-wrap:wrap;">
+        ${isCarousel ? `<button class="btn btn-primary btn-sm" onclick="editResultPlan(${ri})">✎ Edit in Editor</button>`
+                     : `<button class="btn btn-green btn-sm" onclick="suggestForResult(${ri})">✨ Suggest images</button>`}
+        <a href="/outputs/${r.rel}/" target="_blank" class="btn btn-ghost btn-sm">Open folder ↗</a>
+      </div>
+    </div>`;
+}
+
+// Load a result's carousel/listicle plan into the editor.
+async function editResultPlan(ri) {
+  const r = S.results[ri];
+  if (!r || !r.plan) { toast('No editable plan for this result','err'); return; }
+  // Switch brand FIRST and wait — switchBrand clears S.plan + server session,
+  // so loading the plan before it finishes would get wiped by the race.
+  if (r.brand && r.brand !== curBrand()) {
+    const sel = g('brand-sel'); if (sel) sel.value = r.brand;
+    await switchBrand(r.brand);
+  }
+  loadPlan(r.plan);
+  S.imagePaths = {};
+  await api('/api/plan','PUT',r.plan).catch(()=>{});
+  showTab('editor', document.querySelectorAll('.nav-btn')[2]);
+  toast('Loaded into editor — tweak then Render');
+}
+
+// ✨ Suggest images for a single-card result → swap + re-render just that post.
+async function suggestForResult(ri) {
+  const r = S.results[ri];
+  const q = r.image_query || r.title || '';
+  const source = g('bulk-src')?.value || g('batch-src')?.value || 'pexels';
+  openModal(`✨ Suggest images · ${source} · "${esc(q)}"`);
+  const body = g('modal-body');
+  body.innerHTML = '<div style="color:var(--muted);font-size:12px;"><span class="spin"></span> Searching…</div>';
+  try {
+    const data = await api('/api/images/search','POST',{query:q, source, count:12});
+    const results = data.results || [];
+    if (!results.length) { body.innerHTML = '<div style="color:var(--muted);font-size:12px;">No results.</div>'; return; }
+    body.innerHTML = `
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">${results.length} images. Click one to swap it in and re-render this post.</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+        ${results.map(rr=>`
+          <div style="cursor:pointer;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:#0d1828;" onclick='pickForResult(${ri}, ${JSON.stringify(rr.url)}, ${JSON.stringify(source)})' title="${esc(rr.title||'')}">
+            <img src="${esc(rr.thumb||rr.url)}" style="width:100%;height:120px;object-fit:cover;display:block;" loading="lazy" onerror="this.style.opacity=.3">
+          </div>`).join('')}
+      </div>`;
+  } catch(e){ body.innerHTML = `<div style="color:var(--red);font-size:12px;">${esc(e.message)}</div>`; }
+}
+
+async function pickForResult(ri, url, source) {
+  const r = S.results[ri];
+  const body = g('modal-body');
+  if (body) body.innerHTML = '<div style="color:var(--muted);font-size:12px;"><span class="spin"></span> Swapping & re-rendering…</div>';
+  try {
+    const dl = await api('/api/images/from-url','POST',{ url, name:`${r.slug||'post'}`, filter: source==='google' });
+    const re = await api('/api/bulk/rerender','POST',{
+      plan: r.plan, format: r.format, brand: r.brand, image_paths: { 0: dl.path },
+    });
+    r.rel = re.rel; r.files = re.files;
+    const imgs = g('rc-imgs-'+ri);
+    if (imgs) imgs.innerHTML = r.files.map(f=>`<a href="/outputs/${r.rel}/${f}?t=${Date.now()}" target="_blank"><img src="/outputs/${r.rel}/${f}?t=${Date.now()}" style="height:120px;border-radius:5px;border:1px solid var(--border);"></a>`).join('');
+    closeModal();
+    toast('Image swapped & re-rendered');
+  } catch(e){ toast(e.message,'err'); closeModal(); }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1699,6 +2766,7 @@ async function runBatch() {
 
 function showBatchResults(data) {
   S.batch = data.results || [];
+  S.results = S.batch;   // shared store so ✨ Suggest / re-render work by index
   const list = document.getElementById('stories-list');
   list.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
@@ -1719,10 +2787,10 @@ function showBatchResults(data) {
           ${r.files.map(f=>`<a href="/outputs/${r.rel}/${f}" target="_blank"><img src="/outputs/${r.rel}/${f}" style="height:120px;border-radius:5px;border:1px solid var(--border);"></a>`).join('')}
         </div>
         <div class="story-reason" style="white-space:pre-wrap;">${esc(r.caption)}</div>
-        <div class="story-actions" style="margin-top:8px;">
-          ${r.format==='carousel'
+        <div class="story-actions" style="margin-top:8px;flex-wrap:wrap;">
+          ${(r.format==='carousel'||r.format==='listicle')
             ? `<button class="btn btn-primary btn-sm" onclick="editBatchPlan(${ri})">✎ Edit in Editor</button>`
-            : `<span style="font-size:11px;color:var(--muted);">single-card format — edit in the Canvas/Templates tab</span>`}
+            : `<button class="btn btn-green btn-sm" onclick="suggestForResult(${ri})">✨ Suggest images</button>`}
           <a href="/outputs/${r.rel}/" target="_blank" class="btn btn-ghost btn-sm">Open folder ↗</a>
         </div>
       </div>` : `
@@ -1743,7 +2811,7 @@ function editBatchPlan(ri) {
   loadPlan(r.plan);
   S.imagePaths = {};
   api('/api/plan', 'PUT', r.plan).catch(()=>{});   // sync server session for preview/render
-  showTab('editor', document.querySelectorAll('.nav-btn')[1]);
+  showTab('editor', document.querySelectorAll('.nav-btn')[2]);
   toast('Loaded into editor — tweak then Render');
 }
 
@@ -1792,7 +2860,7 @@ async function useStor(i) {
     });
     document.getElementById('hdr-timer').textContent = data.elapsed+'s';
     loadPlan(data.plan);
-    showTab('editor', document.querySelectorAll('.nav-btn')[1]);
+    showTab('editor', document.querySelectorAll('.nav-btn')[2]);
     toast(`Plan ready (${data.elapsed}s)`);
     notify('Plan ready', `${(data.plan.title_card&&data.plan.title_card.headline)||s.title.slice(0,60)} · ${data.elapsed}s`);
   } catch(e) {
@@ -2541,6 +3609,79 @@ async function previewTemplate() {
 function closeModal(){ g('modal-bg').style.display='none'; }
 function openModal(title){ g('modal-title').textContent=title; g('modal-bg').style.display='flex'; }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Settings panel — edit the defaults that get applied on every load.
+// ═══════════════════════════════════════════════════════════════════════════
+function openSettings() {
+  toggleNav(false);
+  openModal('⚙ Settings & defaults');
+  const body = g('modal-body');
+  const opt = (v, l, cur) => `<option value="${esc(v)}" ${String(v)===String(cur)?'selected':''}>${esc(l)}</option>`;
+  const tones = [['','Auto'],['positive, upbeat','Positive'],['negative, critical','Negative'],
+                 ['neutral, factual','Neutral'],['hyped, exciting','Hype'],
+                 ['analytical, measured','Analytical'],['skeptical, cautionary','Skeptical']];
+  const ms = g('model-sel');
+  const models = ms ? [...ms.options].map(o=>o.value)
+      .filter(v=>v && v!=='Loading…' && v!=='No models found') : [];
+  const modelOpts = ['<option value="">(server default)</option>']
+      .concat(models.map(m=>opt(m,m,SETTINGS.model))).join('');
+  const row = (label, hint, control) => `
+    <div class="set-row">
+      <div class="set-label">${label}${hint?`<span class="set-hint">${hint}</span>`:''}</div>
+      <div class="set-control">${control}</div>
+    </div>`;
+  const sel = (id, optsHtml) => `<select id="${id}" class="src-sel" style="width:100%;max-width:none;min-height:38px;">${optsHtml}</select>`;
+  const num = (id, val, min, max) => `<input type="number" id="${id}" value="${val}" min="${min}" max="${max}" style="width:100%;background:#0d1828;border:1px solid var(--border);border-radius:6px;color:#fff;padding:7px 8px;font-size:14px;">`;
+  body.innerHTML = `
+    ${row(`<label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+        <input type="checkbox" id="set-notify" ${SETTINGS.notify?'checked':''} style="width:16px;height:16px;">
+        Desktop notifications</label>`, 'On by default — pings you when a run finishes', '')}
+    ${row('Default model', 'Used for scoring & copy', sel('set-model', modelOpts))}
+    ${row('Default tone', 'Stance applied to generated copy', sel('set-tone', tones.map(([v,l])=>opt(v,l,SETTINGS.tone)).join('')))}
+    ${row('Default image source', '', sel('set-source', [['pexels','Pexels'],['unsplash','Unsplash'],['google','Google']].map(([v,l])=>opt(v,l,SETTINGS.imageSource)).join('')))}
+    ${row('Default carousel slides', '', sel('set-slides', [3,4,5,6].map(n=>opt(n,n+' slides',SETTINGS.slides)).join('')))}
+    ${row('Stories to fetch', '', num('set-fetch', SETTINGS.fetchLimit, 3, 60))}
+    ${row('Top N to keep', '', num('set-top', SETTINGS.fetchTop, 1, 15))}
+    <div style="display:flex;justify-content:space-between;gap:8px;margin-top:6px;border-top:1px solid var(--border);padding-top:12px;">
+      <button class="btn btn-ghost btn-sm" onclick="resetSettings()">↺ Reset to defaults</button>
+      <button class="btn btn-green" onclick="saveSettingsForm()">Save settings</button>
+    </div>`;
+}
+
+async function saveSettingsForm() {
+  const wantNotify = g('set-notify').checked;
+  SETTINGS.model       = g('set-model').value;
+  SETTINGS.tone        = g('set-tone').value;
+  SETTINGS.imageSource = g('set-source').value;
+  SETTINGS.slides      = parseInt(g('set-slides').value) || 4;
+  SETTINGS.fetchLimit  = parseInt(g('set-fetch').value) || 15;
+  SETTINGS.fetchTop    = parseInt(g('set-top').value) || 6;
+  // Reconcile the notification toggle with the actual browser permission.
+  if (wantNotify && !S.notify && ('Notification' in window)) {
+    let p = Notification.permission;
+    if (p !== 'granted') p = await Notification.requestPermission();
+    S.notify = p === 'granted';
+    if (p !== 'granted') toast('Allow notifications in your browser to enable them','err');
+  } else if (!wantNotify) {
+    S.notify = false;
+  }
+  SETTINGS.notify = wantNotify;
+  saveSettings();
+  applySettings();
+  updateNotifBtn();
+  closeModal();
+  toast('Settings saved');
+}
+
+function resetSettings() {
+  SETTINGS = {...SETTINGS_DEFAULTS};
+  saveSettings();
+  applySettings();
+  updateNotifBtn();
+  openSettings();   // re-render the form with defaults
+  toast('Reset to defaults');
+}
+
 async function savePlan() {
   if (!S.plan) { toast('No plan to save','err'); return; }
   syncPlan();
@@ -2581,7 +3722,7 @@ async function loadSavedPlan(id) {
     const data = await api('/api/library/plan/'+id);
     loadPlan(data.plan);
     closeModal();
-    showTab('editor', document.querySelectorAll('.nav-btn')[1]);
+    showTab('editor', document.querySelectorAll('.nav-btn')[2]);
     toast('Plan loaded');
   } catch(e){ toast(e.message,'err'); }
 }

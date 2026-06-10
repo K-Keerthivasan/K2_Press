@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.tailscale.example
 
 # ── Python ─────────────────────────────────────────────────────
 .venv/
@@ -21,6 +22,7 @@ outputs/
 image_cache/
 library/
 .active_brand
+tailscale/state/
 *.bak
 test_*.png
 

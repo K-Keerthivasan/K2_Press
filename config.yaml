@@ -191,3 +191,34 @@ formats:
     height:   900
     type:     single
     template: xpost.html
+  # ── New post types (both brands, themed) ───────────────────────────────────
+  quote:
+    name:     "Quote / Stat"
+    width:    1080
+    height:   1350
+    type:     single
+    template: quote.html
+  comparison:
+    name:     "Comparison / VS"
+    width:    1080
+    height:   1350
+    type:     single
+    template: comparison.html
+  breaking:
+    name:     "Breaking / Hot Take"
+    width:    1080
+    height:   1350
+    type:     single
+    template: breaking.html
+  listicle:
+    name:   "Listicle / Top-N"
+    width:  1080
+    height: 1350
+    type:   multi
+  linkedin:
+    name:     "LinkedIn (K2)"
+    width:    1200
+    height:   1200
+    type:     single
+    template: linkedin.html
+    brands:   ["k2"]      # K2-only single hot-take post

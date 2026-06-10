@@ -12,10 +12,12 @@ __pycache__
 .env
 .env.*
 !.env.example
+!.env.tailscale.example
 
 outputs
 image_cache
 library
+tailscale/state
 *.bak
 *.log
 test_*.png

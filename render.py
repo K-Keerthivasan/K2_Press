@@ -116,10 +116,17 @@ def render_slide_to_bytes(
 # ── full carousel ────────────────────────────────────────────────────────────
 
 def generate_carousel(plan: dict, image_paths: dict | None = None,
-                      out_root: Path | None = None) -> Path:
-    """Render all slides for a plan. Returns the output directory path."""
+                      out_root: Path | None = None,
+                      brand_key: str | None = None,
+                      templates: dict | None = None) -> Path:
+    """Render all slides for a plan. Returns the output directory path.
+
+    ``brand_key`` renders for a specific brand regardless of the global active
+    brand (used by cross-brand bulk runs). ``templates`` overrides the
+    title/content/outro template names (used by the listicle format).
+    """
     config    = _load_config()
-    brand     = resolve_brand(config)
+    brand     = resolve_brand(config, brand_key)
     out_cfg   = config.get("output", {})
     width     = out_cfg.get("width",  1080)
     height    = out_cfg.get("height", 1350)
@@ -129,9 +136,10 @@ def generate_carousel(plan: dict, image_paths: dict | None = None,
     handle    = brand.get("handle", "@k2digitalmedia_")
 
     slug      = plan.get("slug", "post")
-    bkey      = active_key(config) or "default"
+    bkey      = brand_key or active_key(config) or "default"
+    fmt_label = plan.get("format", "carousel")
     root      = out_root or (Path(out_cfg.get("directory", "outputs")) / bkey)
-    out_dir   = root / f"{date.today().isoformat()}_{slug}_carousel"
+    out_dir   = root / f"{date.today().isoformat()}_{slug}_{fmt_label}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     content_slides = plan.get("content_slides", [])
@@ -151,9 +159,10 @@ def generate_carousel(plan: dict, image_paths: dict | None = None,
         **_layout_vars(plan),
     }
 
-    t_title   = brand_template(brand, "title",   "title.html")
-    t_content = brand_template(brand, "content", "content.html")
-    t_outro   = brand_template(brand, "outro",   "outro.html")
+    over      = templates or {}
+    t_title   = over.get("title")   or brand_template(brand, "title",   "title.html")
+    t_content = over.get("content") or brand_template(brand, "content", "content.html")
+    t_outro   = over.get("outro")   or brand_template(brand, "outro",   "outro.html")
     # Image-forward brands (e.g. JKR) show a hero image on the title card; reuse
     # the first content slide's image so the cover leads with a visual.
     title_img = None
@@ -215,17 +224,18 @@ def generate_single(
     fmt: str,
     image_path: str | Path | None = None,
     out_root: Path | None = None,
+    brand_key: str | None = None,
 ) -> Path:
     """Render a single-card post (square/story/x). Returns the output directory."""
     config = _load_config()
-    brand  = resolve_brand(config)
+    brand  = resolve_brand(config, brand_key)
     fcfg   = format_config(fmt, config)
     width  = fcfg.get("width", 1080)
     height = fcfg.get("height", 1080)
     tmpl   = fcfg.get("template", f"{fmt}.html")
 
     slug    = plan.get("slug", "post")
-    bkey    = active_key(config) or "default"
+    bkey    = brand_key or active_key(config) or "default"
     root    = out_root or (Path(config.get("output", {}).get("directory", "outputs")) / bkey)
     out_dir = root / f"{date.today().isoformat()}_{slug}_{fmt}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -271,28 +281,42 @@ def _write_caption(plan: dict, out_dir: Path, fmt: str = "carousel") -> None:
                                          encoding="utf-8")
 
 
+# Multi-slide formats that render through the carousel pipeline, with their own
+# content template. (title/outro fall back to the brand defaults.)
+CAROUSEL_FORMATS = {
+    "carousel": {},
+    "listicle": {"content": "listicle_content.html"},
+}
+
+
 def generate_post(
     plan: dict,
     fmt: str = "carousel",
     image_paths: dict | None = None,
     out_root: Path | None = None,
+    brand_key: str | None = None,
 ) -> Path:
     """Dispatch render by format. image_paths is a dict for carousel, or {0: path}/path for single."""
-    if fmt == "carousel":
-        return generate_carousel(plan, image_paths, out_root=out_root)
+    if fmt in CAROUSEL_FORMATS:
+        plan.setdefault("format", fmt)
+        return generate_carousel(plan, image_paths, out_root=out_root,
+                                 brand_key=brand_key,
+                                 templates=CAROUSEL_FORMATS[fmt] or None)
     img = None
     if isinstance(image_paths, dict):
         img = image_paths.get(0) or image_paths.get("0")
     else:
         img = image_paths
-    return generate_single(plan, fmt, image_path=img, out_root=out_root)
+    return generate_single(plan, fmt, image_path=img, out_root=out_root,
+                           brand_key=brand_key)
 
 
 # ── base vars helper (reused by app.py) ─────────────────────────────────────
 
-def _base_vars(plan: dict, image_paths: dict | None = None) -> dict:
+def _base_vars(plan: dict, image_paths: dict | None = None,
+               brand_key: str | None = None) -> dict:
     config   = _load_config()
-    brand    = resolve_brand(config)
+    brand    = resolve_brand(config, brand_key)
     return {
         "css_path":     _uri(Path("static/brand.css")),
         "logo_path":    _uri(Path(brand.get("logo_path", "static/logo.png"))),

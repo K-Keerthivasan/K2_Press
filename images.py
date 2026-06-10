@@ -28,15 +28,19 @@ def _slugify(text: str) -> str:
 
 # ── Slight filter (Pillow) ────────────────────────────────────────────────────
 
-def _filter_params() -> dict | None:
-    """Merge global + active-brand filter settings. Returns None if disabled."""
+def _filter_params(brand_key: str | None = None) -> dict | None:
+    """Merge global + brand filter settings. Returns None if disabled.
+
+    ``brand_key`` picks a specific brand's image_filter override; without it the
+    current active brand is used.
+    """
     try:
         import yaml
         from brands import resolve_brand
         with open("config.yaml", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         glob  = (cfg.get("images", {}) or {}).get("filter", {}) or {}
-        brand = resolve_brand(cfg).get("image_filter", {}) or {}
+        brand = resolve_brand(cfg, brand_key).get("image_filter", {}) or {}
         params = {**DEFAULT_FILTER, **glob, **brand}
         return params if params.get("enabled", True) else None
     except Exception as exc:                       # never let config break a fetch

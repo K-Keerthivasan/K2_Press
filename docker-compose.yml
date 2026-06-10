@@ -20,3 +20,25 @@ services:
       - ./static:/app/static
       - ./Assets:/app/Assets
     restart: unless-stopped
+
+  k2-posttool-tailscale:
+    image: tailscale/tailscale:stable
+    container_name: k2-posttool-tailscale
+    profiles:
+      - tailscale
+    env_file:
+      - path: .env.tailscale
+        required: false
+    environment:
+      TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: "k2-posttool"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_ENABLE_HEALTH_CHECK: "true"
+    volumes:
+      - ./tailscale:/config
+      - ./tailscale/state:/var/lib/tailscale
+    network_mode: "service:k2-posttool"
+    depends_on:
+      - k2-posttool
+    restart: unless-stopped

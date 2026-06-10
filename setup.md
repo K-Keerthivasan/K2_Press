@@ -77,3 +77,25 @@ ollama pull qwen3:8b
 
 Generated output, image cache, and saved library data are bind-mounted to `outputs/`,
 `image_cache/`, and `library/`.
+
+## Tailscale access
+
+Create a Tailscale pre-auth key in the Tailscale admin console, then add it to
+`.env.tailscale`:
+
+```env
+TS_AUTHKEY=tskey-auth-your-key
+```
+
+Start the app and its Tailscale sidecar:
+
+```powershell
+docker compose --profile tailscale up -d --build
+```
+
+The sidecar keeps its node identity in `tailscale/state/` and publishes the FastAPI app
+with Tailscale Serve over HTTPS. Check the private tailnet URL with:
+
+```powershell
+docker exec k2-posttool-tailscale tailscale serve status
+```

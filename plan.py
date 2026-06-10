@@ -209,6 +209,182 @@ RULES:
     return plan
 
 
+# ── New post types (quote / comparison / breaking / linkedin / listicle) ──────
+
+def _brand_ctx(brand: dict, tone: str) -> dict:
+    """Shared brand prompt context used by the specialised planners."""
+    location = brand.get("location", "")
+    eff_tone = (tone or brand.get("tone") or "").strip()
+    return {
+        "name":      brand.get("name", "the brand"),
+        "handle":    brand.get("handle", "@handle"),
+        "profile":   (brand.get("profile") or "").strip() or _safe_profile(),
+        "tags":      json.dumps(brand.get("hashtags", ["news"])),
+        "location":  location,
+        "loc_rule":  (f"- Make {location} relevance explicit when not obvious.\n"
+                      if location else ""),
+        "extra_ctx": _tone_directive(eff_tone),
+        "eff_tone":  eff_tone,
+    }
+
+
+# Per-format JSON schema body + a one-line description, injected into a shared
+# system prompt. Each schema is a single JSON object the model must return.
+_SPECIAL_FORMATS = {
+    "quote": {
+        "desc": "A single bold quote/stat card (1080x1350). Pull out ONE striking "
+                "statistic or quotable line from the story.",
+        "schema": '''  "quote":        "<the striking stat or pull-quote, max 120 chars>",
+  "context":      "<one supporting line that frames it, max 90 chars>",
+  "source_label": "<short attribution e.g. 'via TechCrunch', max 40 chars>",
+  "image_query":  "<2-4 word Pexels phrase that fits the mood>",''',
+    },
+    "comparison": {
+        "desc": "A single A-vs-B comparison card (1080x1350). Compare two things "
+                "from the story (tools, options, approaches, before/after).",
+        "schema": '''  "headline":  "<what is being compared, max 70 chars>",
+  "option_a":  {"label": "<name, max 24 chars>", "points": "<2-3 em-dash bullets, each on its own line>"},
+  "option_b":  {"label": "<name, max 24 chars>", "points": "<2-3 em-dash bullets, each on its own line>"},
+  "verdict":   "<the takeaway / who wins, max 90 chars>",
+  "image_query": "<2-4 word Pexels phrase>",''',
+    },
+    "breaking": {
+        "desc": "A single reactive 'breaking news / hot take' card (1080x1350). "
+                "Fast, punchy, opinionated.",
+        "schema": '''  "banner":      "<2-3 word label, ALL CAPS, e.g. BREAKING or HOT TAKE>",
+  "headline":    "<the news or take, max 80 chars>",
+  "take":        "<1-2 punchy sentences of reaction, max 170 chars>",
+  "image_query": "<2-4 word Pexels phrase>",''',
+    },
+    "linkedin": {
+        "desc": "A single square (1200x1200) LinkedIn post — a professional hot "
+                "take for a business audience. Confident but not clickbait.",
+        "schema": '''  "hook":        "<scroll-stopping first line, max 90 chars>",
+  "take":        "<the opinion/insight, 1-2 sentences, max 180 chars>",
+  "points":      "<2-3 em-dash bullets, each on its own line>",
+  "cta":         "<one professional action, max 60 chars>",
+  "image_query": "<2-4 word Pexels phrase>",''',
+    },
+}
+
+
+def plan_special(
+    story: Story,
+    fmt: str,
+    config: dict | None = None,
+    model: str | None = None,
+    brand: dict | None = None,
+    tone: str = "",
+) -> dict:
+    """Plan one of the new single-card formats (quote/comparison/breaking/linkedin)."""
+    if config is None:
+        config = load_config()
+    if brand is None:
+        from brands import resolve_brand
+        brand = resolve_brand(config)
+    spec = _SPECIAL_FORMATS[fmt]
+    ctx  = _brand_ctx(brand, tone)
+
+    system = f"""You are a content planner for {ctx['name']}. You write sharp,
+value-first social posts — no fluff.
+
+CREATOR PROFILE:
+{ctx['profile']}
+{ctx['extra_ctx']}
+FORMAT: {spec['desc']}
+
+Return ONE valid JSON object (no markdown, no code fences) with EXACTLY these keys:
+{{
+  "slug":   "<kebab-case, max 40 chars>",
+  "format": "{fmt}",
+{spec['schema']}
+  "caption":  "<platform caption, 2-4 sentences, no hashtags>",
+  "hashtags": {ctx['tags']},
+  "dm_keyword": "<one word>"
+}}
+
+RULES:
+- Lead with value, not background.
+- Stay factual and true to the source story; do not invent specifics.
+{ctx['loc_rule']}- Body bullets use em-dash format: — point one\\n— point two"""
+
+    user = (
+        f"Story title:   {story.title}\n"
+        f"Story summary: {story.summary[:900]}\n"
+        f"Source URL:    {story.url}"
+    )
+    plan = chat_json(system, user, model=model)
+    plan.setdefault("format", fmt)
+    if ctx["eff_tone"]:
+        plan["tone"] = ctx["eff_tone"]
+    return plan
+
+
+def plan_listicle(
+    story: Story,
+    config: dict | None = None,
+    total_slides: int | None = None,
+    model: str | None = None,
+    brand: dict | None = None,
+    tone: str = "",
+) -> dict:
+    """Plan a numbered Top-N listicle carousel (each content slide is a ranked item)."""
+    if config is None:
+        config = load_config()
+    if brand is None:
+        from brands import resolve_brand
+        brand = resolve_brand(config)
+    ctx = _brand_ctx(brand, tone)
+
+    n_items = max(3, min(8, (total_slides - 2) if total_slides else 5))
+    total   = 1 + n_items + 1
+
+    system = f"""You are an Instagram listicle planner for {ctx['name']}.
+You build punchy numbered "Top {n_items}" carousels — value first, no fluff.
+
+CREATOR PROFILE:
+{ctx['profile']}
+{ctx['extra_ctx']}
+Return ONE valid JSON object (no markdown, no code fences) with EXACTLY these keys:
+{{
+  "slug": "<kebab-case, max 40 chars>",
+  "format": "listicle",
+  "slide_count": {total},
+  "title_card": {{
+    "headline": "<e.g. 'Top {n_items} ...', max 60 chars>",
+    "subhead":  "<one hook sentence, max 90 chars>"
+  }},
+  "content_slides": [
+    {{
+      "rank":        <integer countdown position>,
+      "heading":     "<the item name, ALL CAPS, 2-5 words>",
+      "body":        "<1-2 em-dash lines on why it matters>",
+      "image_query": "<2-4 word Pexels phrase that fits this item>"
+    }}
+  ],
+  "outro_card": {{ "cta": "<single clear action, max 65 chars>", "handle": "{ctx['handle']}" }},
+  "caption":    "<Instagram caption, 3-4 sentences, no hashtags>",
+  "hashtags":   {ctx['tags']},
+  "dm_keyword": "<one word>"
+}}
+
+RULES:
+- content_slides MUST have EXACTLY {n_items} items, ranked {n_items} down to 1 (countdown).
+- Each item is concrete and distinct; lead with the item, not background.
+{ctx['loc_rule']}- Body bullets use em-dash format: — point one\\n— point two"""
+
+    user = (
+        f"Story title:   {story.title}\n"
+        f"Story summary: {story.summary[:900]}\n"
+        f"Source URL:    {story.url}"
+    )
+    plan = chat_json(system, user, model=model)
+    plan.setdefault("format", "listicle")
+    if ctx["eff_tone"]:
+        plan["tone"] = ctx["eff_tone"]
+    return plan
+
+
 def plan_post(
     story: Story,
     fmt: str = "carousel",
@@ -224,6 +400,11 @@ def plan_post(
                           brand=brand, tone=tone)
         plan.setdefault("format", "carousel")
         return plan
+    if fmt == "listicle":
+        return plan_listicle(story, config, total_slides=total_slides, model=model,
+                             brand=brand, tone=tone)
+    if fmt in _SPECIAL_FORMATS:
+        return plan_special(story, fmt, config=config, model=model, brand=brand, tone=tone)
     if fmt == "cover":
         # The brand-cover card is purely static brand furniture — no LLM call.
         return {"format": "cover", "slug": "brand-cover"}

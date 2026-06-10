@@ -155,3 +155,31 @@ html, body {
   color: rgba(255,255,255,0.45);
 }
 .meta-line.center { text-align: center; }
+
+/* ═══ Per-brand theming hooks for the new post types ═════════════════════════
+   The new templates (quote / comparison / breaking / linkedin / listicle) set
+   <body class="brand-{short}"> so each brand can diverge without duplicating
+   the HTML. K2 keeps the clean, rounded look (defaults above); JKR goes harder
+   edged and louder, matching its near-black + red, image-led identity. */
+
+/* JKR has a wide wordmark — never crop it into a circle. */
+.brand-jkr .badge-brand .b-mark,
+.brand-jkr .lockup .mark {
+  border-radius: 6px; width: auto; height: 46px; max-width: 168px;
+  object-fit: contain;
+}
+.brand-jkr .lockup .mark { height: 54px; }
+
+/* Sharper, louder accent furniture for JKR. */
+.brand-jkr .banner { border-radius: 0; letter-spacing: 3px; }
+.brand-jkr .cta,
+.brand-jkr .col { border-radius: 4px; }
+.brand-jkr .vs { border-radius: 6px; }
+.brand-jkr .teal-rule { width: 80px; height: 5px; border-radius: 0; }
+.brand-jkr .headline,
+.brand-jkr .hook,
+.brand-jkr .quote { letter-spacing: -2px; }
+
+/* K2 stays soft and editorial. */
+.brand-k2 .banner { letter-spacing: 2px; }
+.brand-k2 .col { background: rgba(255,255,255,0.05); }

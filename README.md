@@ -54,6 +54,31 @@ Open `http://localhost:8000`. The compose setup maps `outputs/`, `image_cache/`,
 `library/` back to the project folder, and points containerized Ollama requests to
 `http://host.docker.internal:11434/v1`.
 
+### Docker + Tailscale
+
+Add a Tailscale pre-auth key to a local `.env.tailscale` file:
+
+```env
+TS_AUTHKEY=tskey-auth-your-key
+```
+
+Then run the app with the Tailscale sidecar:
+
+```powershell
+docker compose --profile tailscale up -d --build
+```
+
+The sidecar uses Tailscale Serve to proxy the app privately over HTTPS inside your
+tailnet. After it starts, get the URL with:
+
+```powershell
+docker exec k2-posttool-tailscale tailscale serve status
+```
+
+On your phone or another device logged into the same tailnet, open the shown
+`https://k2-posttool.<your-tailnet>.ts.net` URL. The local Docker URL still works at
+`http://localhost:8000`.
+
 ---
 
 ## Using the app

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="{{ css_path }}">
+  <style>{{ theme_css }}</style>
+  <style>
+    .layer {
+      position: relative; z-index: 2; height: 100%;
+      display: flex; flex-direction: column;
+      padding: 70px 70px 64px;
+    }
+    .top-bar { display: flex; align-items: center; justify-content: space-between; }
+    .handle-top { font-size: 20px; font-weight: 600; color: var(--teal); }
+
+    .headline {
+      margin: 28px 0 0; font-size: 56px; font-weight: 800; line-height: 1.02;
+      letter-spacing: -1px; color: #fff; text-align: center; max-width: 940px;
+      align-self: center;
+    }
+
+    .cols {
+      flex: 1; display: flex; align-items: stretch; gap: 26px;
+      margin: 34px 0 28px; position: relative;
+    }
+    .col {
+      flex: 1; display: flex; flex-direction: column; gap: 22px;
+      padding: 40px 34px;
+      background: rgba(255,255,255,0.045);
+      border: 1px solid var(--frame); border-radius: 18px;
+    }
+    .col .label {
+      font-size: 38px; font-weight: 800; line-height: 1.05; color: #fff;
+      text-transform: uppercase; letter-spacing: -0.5px;
+    }
+    .col .points {
+      margin: 0; font-size: 29px; font-weight: 400; line-height: 1.34;
+      color: rgba(255,255,255,0.88); white-space: pre-line;
+    }
+    .col .tag { font-size: 18px; font-weight: 700; letter-spacing: 3px; color: var(--teal); }
+
+    .vs {
+      position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
+      width: 92px; height: 92px; border-radius: 50%;
+      background: var(--teal); color: var(--navy);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 34px; font-weight: 800; z-index: 3;
+      box-shadow: 0 0 0 10px rgba(8,12,22,0.85);
+    }
+
+    .verdict {
+      text-align: center; font-size: 30px; font-weight: 600; line-height: 1.25;
+      color: #fff; max-width: 900px; align-self: center;
+    }
+    .verdict b { color: var(--teal); }
+    .bottom-bar { display: flex; justify-content: center; margin-top: 24px; }
+  </style>
+</head>
+<body class="brand-{{ brand.short|lower }}">
+<main class="slide">
+  {% if background_image %}<img class="bg-image" src="{{ background_image }}" alt="">{% endif %}
+  <img class="wm" src="{{ logo_path }}" style="{{ wm_style }}" alt="">
+
+  <div class="layer">
+    <div class="top-bar">
+      <div class="badge-brand">
+        <img class="b-mark" src="{{ logo_path }}" alt="{{ brand.name }}">
+        <span class="b-name">{{ brand.name }}</span>
+      </div>
+      <span class="handle-top">{{ handle }}</span>
+    </div>
+
+    <h1 class="headline">{{ post.headline or 'This vs That' }}</h1>
+
+    <div class="cols">
+      <div class="col">
+        <span class="tag">OPTION A</span>
+        <div class="label">{{ post.option_a.label if post.option_a else 'A' }}</div>
+        <p class="points">{{ post.option_a.points if post.option_a else '' }}</p>
+      </div>
+      <div class="vs">VS</div>
+      <div class="col">
+        <span class="tag">OPTION B</span>
+        <div class="label">{{ post.option_b.label if post.option_b else 'B' }}</div>
+        <p class="points">{{ post.option_b.points if post.option_b else '' }}</p>
+      </div>
+    </div>
+
+    {% if post.verdict %}<div class="verdict"><b>Verdict:</b> {{ post.verdict }}</div>{% endif %}
+
+    <div class="bottom-bar">
+      <span class="meta-line">{{ handle }}</span>
+    </div>
+  </div>
+</main>
+</body>
+</html>
