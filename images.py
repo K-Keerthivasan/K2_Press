@@ -5,7 +5,7 @@ import os
 import re
 import hashlib
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from dotenv import load_dotenv
@@ -176,6 +176,61 @@ def fetch_google(query: str) -> Path:
     return fetch_from_url(results[0]["url"], custom_name=f"g-{_slugify(query)}")
 
 
+# ── Article images (RSS entry image → page og:image → Pexels fallback) ───────
+
+def _og_image(page_url: str) -> str:
+    """Scrape an article page for its og:image / twitter:image (no new deps)."""
+    try:
+        resp = requests.get(page_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+        resp.raise_for_status()
+    except Exception as exc:
+        print(f"[images] og:image fetch failed for {page_url}: {exc}")
+        return ""
+    html = resp.text
+    patterns = (
+        r'<meta[^>]+property=["\']og:image(?::url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::url)?["\']',
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+    )
+    for pat in patterns:
+        m = re.search(pat, html, re.I)
+        if m:
+            url = m.group(1).strip()
+            if url.startswith("//"):
+                return "https:" + url
+            if url.startswith("/"):
+                return urljoin(page_url, url)
+            return url
+    return ""
+
+
+def fetch_article_image(image_url: str = "", page_url: str = "",
+                        fallback_query: str = "", fallback_source: str = "pexels") -> Path:
+    """Source the article's own image, then fall back to a query-based source.
+
+    1. The image URL extracted from the RSS entry (if any).
+    2. The article page's og:image / twitter:image.
+    3. ``fallback_query`` via Pexels (or ``fallback_source``).
+    """
+    if image_url:
+        try:
+            return fetch_from_url(image_url, custom_name=f"feed-{_slugify(page_url or image_url)}")
+        except Exception as exc:
+            print(f"[images] feed image failed ({image_url}): {exc}")
+    if page_url:
+        og = _og_image(page_url)
+        if og:
+            try:
+                return fetch_from_url(og, custom_name=f"og-{_slugify(page_url)}")
+            except Exception as exc:
+                print(f"[images] og:image failed ({og}): {exc}")
+    if fallback_query:
+        eff = "pexels" if fallback_source == "feed" else fallback_source
+        print(f"[images] feed -> falling back to {eff} for '{fallback_query}'")
+        return fetch_image(fallback_query, eff)
+    raise RuntimeError("No article image and no fallback query available.")
+
+
 # ── Multi-result candidate search (for the picker grid) ──────────────────────
 
 def search_images(query: str, source: str = "pexels", count: int = 10) -> list[dict]:
@@ -301,12 +356,23 @@ def fetch_image(query: str, source: str = "pexels") -> Path:
 def fetch_images_for_plan(
     plan: dict, source: str = "pexels"
 ) -> dict[int, Path | None]:
-    """Fetch one image per content slide. Returns {slide_index: Path | None}."""
+    """Fetch one image per content slide. Returns {slide_index: Path | None}.
+
+    With ``source="feed"`` the lead slide gets the source article's own image
+    (RSS entry → og:image → Pexels), and the remaining slides fall back to
+    Pexels using each slide's ``image_query``.
+    """
     results: dict[int, Path | None] = {}
+    src_img = plan.get("source_image", "")
+    src_url = plan.get("source_url", "")
     for i, slide in enumerate(plan.get("content_slides", [])):
         query = slide.get("image_query") or "city background"
         try:
-            results[i] = fetch_image(query, source)
+            if source == "feed" and i == 0:
+                results[i] = fetch_article_image(src_img, src_url, fallback_query=query)
+            else:
+                eff = "pexels" if source == "feed" else source
+                results[i] = fetch_image(query, eff)
         except Exception as exc:
             print(f"[images] WARN slide {i} ('{query}'): {exc}")
             results[i] = None

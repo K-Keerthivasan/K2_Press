@@ -1,4 +1,4 @@
-"""Generate a structured carousel post plan for a single story via Ollama."""
+"""Generate structured social post plans through the configured LLM backend."""
 from __future__ import annotations
 import argparse
 import json
@@ -23,6 +23,15 @@ def _safe_profile() -> str:
         return "A social media brand."
 
 
+def _stamp_source(plan: dict, story: Story) -> dict:
+    """Attach the source article's image + URL to the plan so the "feed" image
+    source can use the article's own hero image (with a Pexels fallback)."""
+    if isinstance(plan, dict):
+        plan.setdefault("source_image", story.image or "")
+        plan.setdefault("source_url", story.url or "")
+    return plan
+
+
 def _tone_directive(tone: str) -> str:
     """A system-prompt block that bends the generated content toward a chosen
     stance (e.g. 'positive', 'negative', 'critical') without inventing facts."""
@@ -35,6 +44,88 @@ def _tone_directive(tone: str) -> str:
         "- Let that perspective shape the headline, the framing, and which points\n"
         "  you emphasise — while staying factual and true to the source story.\n"
     )
+
+
+PERSONALITY_TEXT_KEYS = {
+    "headline", "subhead", "heading", "body", "caption", "cta", "tweet_text",
+    "hook", "take", "points", "quote", "context", "source_label", "verdict",
+    "banner",
+}
+
+
+def _personality(brand: dict) -> str:
+    return (brand.get("personality") or "").strip()
+
+
+def _voice_block(brand: dict) -> str:
+    personality = _personality(brand)
+    if not personality:
+        return ""
+    return (
+        "\nBRAND PERSONALITY:\n"
+        f"{personality}\n"
+        "Apply this voice to the actual post copy. Keep facts, schema, and source meaning intact.\n"
+    )
+
+
+def _merge_personality_copy(base, edited):
+    """Copy only safe text fields from a personality edit result into a plan."""
+    if isinstance(base, dict) and isinstance(edited, dict):
+        out = dict(base)
+        for key, old_value in base.items():
+            if key not in edited:
+                continue
+            new_value = edited[key]
+            if key in PERSONALITY_TEXT_KEYS and isinstance(old_value, str) and isinstance(new_value, str):
+                out[key] = new_value.strip() or old_value
+            elif isinstance(old_value, (dict, list)):
+                out[key] = _merge_personality_copy(old_value, new_value)
+        return out
+    if isinstance(base, list) and isinstance(edited, list):
+        return [
+            _merge_personality_copy(old, edited[i]) if i < len(edited) else old
+            for i, old in enumerate(base)
+        ]
+    return base
+
+
+def _polish_personality(plan: dict, story: Story, brand: dict, model: str | None,
+                        tone: str = "") -> dict:
+    personality = _personality(brand)
+    if not personality:
+        return plan
+    brand_name = brand.get("name", "the brand")
+    eff_tone = (tone or brand.get("tone") or plan.get("tone") or "").strip()
+    tone_line = f"\nREQUESTED TONE:\n{eff_tone}\n" if eff_tone else ""
+    system = f"""You are the final copy editor for {brand_name}.
+Rewrite the post copy so it sounds unmistakably on-brand, while preserving the
+existing JSON shape and all source facts.
+
+BRAND PERSONALITY:
+{personality}
+{tone_line}
+Return ONE valid JSON object with the same structure as the input plan.
+
+EDITING RULES:
+- Rewrite only copy fields: headlines, subheads, headings, body text, captions, CTA, hooks, takes, verdicts, quotes, banners, and tweet text.
+- Do not change facts, counts, ranks, formats, URLs, image_query, hashtags, slug, handles, or dm_keyword.
+- Add personality through sharper framing, more specific stakes, and stronger audience relevance.
+- Keep copy concise enough for social graphics.
+- Do not add claims not supported by the source story."""
+    user = (
+        f"Source story:\nTitle: {story.title}\nSummary: {story.summary[:900]}\nURL: {story.url}\n\n"
+        "Current plan JSON:\n"
+        f"{json.dumps(plan, ensure_ascii=False)}"
+    )
+    try:
+        edited = chat_json(system, user, model=model, retries=0)
+    except Exception as exc:
+        print(f"[plan] personality polish skipped: {exc}")
+        return plan
+    polished = _merge_personality_copy(plan, edited)
+    if eff_tone:
+        polished["tone"] = eff_tone
+    return polished
 
 
 def _auto_content_cards(story: Story, config: dict) -> int:
@@ -78,12 +169,14 @@ def plan_story(
     # Per-post tone wins; fall back to a brand-level default tone if set.
     eff_tone   = (tone or brand.get("tone") or "").strip()
     extra_ctx  = _tone_directive(eff_tone)
+    voice_ctx  = _voice_block(brand)
 
     system = f"""You are an Instagram carousel content planner for {brand_name}.
 You write clear, value-first posts — no fluff, no hype.
 
 CREATOR PROFILE:
 {profile}
+{voice_ctx}
 {extra_ctx}
 Return ONE valid JSON object (no markdown, no code fences) with EXACTLY these keys:
 {{
@@ -125,7 +218,7 @@ RULES:
     plan = chat_json(system, user, model=model)
     if eff_tone:
         plan["tone"] = eff_tone
-    return plan
+    return _stamp_source(_polish_personality(plan, story, brand, model, eff_tone), story)
 
 
 # ── Single-card formats (square / story / x) ─────────────────────────────────
@@ -154,6 +247,7 @@ def plan_single(
                   if location else "")
     eff_tone   = (tone or brand.get("tone") or "").strip()
     extra_ctx  = _tone_directive(eff_tone)
+    voice_ctx  = _voice_block(brand)
 
     fmt_notes = {
         "square": "A single square (1080x1080) Instagram feed post. One bold headline plus "
@@ -177,6 +271,7 @@ social posts — no fluff.
 
 CREATOR PROFILE:
 {profile}
+{voice_ctx}
 {extra_ctx}
 FORMAT: {note}
 
@@ -206,7 +301,7 @@ RULES:
     plan.setdefault("format", fmt)
     if eff_tone:
         plan["tone"] = eff_tone
-    return plan
+    return _stamp_source(_polish_personality(plan, story, brand, model, eff_tone), story)
 
 
 # ── New post types (quote / comparison / breaking / linkedin / listicle) ──────
@@ -219,6 +314,7 @@ def _brand_ctx(brand: dict, tone: str) -> dict:
         "name":      brand.get("name", "the brand"),
         "handle":    brand.get("handle", "@handle"),
         "profile":   (brand.get("profile") or "").strip() or _safe_profile(),
+        "voice_ctx":  _voice_block(brand),
         "tags":      json.dumps(brand.get("hashtags", ["news"])),
         "location":  location,
         "loc_rule":  (f"- Make {location} relevance explicit when not obvious.\n"
@@ -290,6 +386,7 @@ value-first social posts — no fluff.
 
 CREATOR PROFILE:
 {ctx['profile']}
+{ctx['voice_ctx']}
 {ctx['extra_ctx']}
 FORMAT: {spec['desc']}
 
@@ -317,7 +414,7 @@ RULES:
     plan.setdefault("format", fmt)
     if ctx["eff_tone"]:
         plan["tone"] = ctx["eff_tone"]
-    return plan
+    return _stamp_source(_polish_personality(plan, story, brand, model, ctx["eff_tone"]), story)
 
 
 def plan_listicle(
@@ -344,6 +441,7 @@ You build punchy numbered "Top {n_items}" carousels — value first, no fluff.
 
 CREATOR PROFILE:
 {ctx['profile']}
+{ctx['voice_ctx']}
 {ctx['extra_ctx']}
 Return ONE valid JSON object (no markdown, no code fences) with EXACTLY these keys:
 {{
@@ -382,7 +480,7 @@ RULES:
     plan.setdefault("format", "listicle")
     if ctx["eff_tone"]:
         plan["tone"] = ctx["eff_tone"]
-    return plan
+    return _stamp_source(_polish_personality(plan, story, brand, model, ctx["eff_tone"]), story)
 
 
 def plan_post(
@@ -421,6 +519,7 @@ def regen_caption(plan: dict, brand: dict | None = None, config: dict | None = N
         brand = resolve_brand(config)
     brand_name = brand.get("name", "the brand")
     tags       = json.dumps(brand.get("hashtags", ["news"]))
+    voice_ctx  = _voice_block(brand)
 
     parts: list[str] = []
     tc = plan.get("title_card", {}) or {}
@@ -432,9 +531,10 @@ def regen_caption(plan: dict, brand: dict | None = None, config: dict | None = N
     tone_line = f"Desired tone: {tone}\n" if tone else ""
 
     system = f"""You write Instagram captions for {brand_name}.
+{voice_ctx}
 {tone_line}Return ONE valid JSON object (no markdown) with EXACTLY these keys:
 {{"caption": "<engaging 3-4 sentence caption, no hashtags>", "hashtags": {tags}}}
-Rules: caption is on-brand and value-first; provide 6-12 relevant hashtags (lowercase, no #)."""
+Rules: caption is on-brand, personality-rich, and value-first; provide 6-12 relevant hashtags (lowercase, no #)."""
     user = f"Post content:\n{content[:1400]}"
     res  = chat_json(system, user, model=model)
     tags_out = res.get("hashtags", [])
@@ -451,7 +551,7 @@ def main() -> None:
     parser.add_argument("--title",   help="Story title (skips feed fetch)")
     parser.add_argument("--summary", help="Story summary")
     parser.add_argument("--url",     default="")
-    parser.add_argument("--model",   help="Ollama model override")
+    parser.add_argument("--model",   help="LLM model override")
     parser.add_argument("--config-feeds", action="store_true")
     args = parser.parse_args()
 
@@ -468,7 +568,7 @@ def main() -> None:
         story   = stories[args.story_index]
         print(f"Story [{args.story_index}]: {story.title}\n")
 
-    print("Planning with Ollama...")
+    print("Planning with the configured LLM backend...")
     plan = plan_story(story, config,
                       total_slides=args.total_slides,
                       model=args.model)

@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:support.google.com)",
+      "Bash(command -v hermes)",
+      "Bash(echo \"hermes on PATH: $\\(command -v hermes || echo NO\\)\")",
+      "Bash(curl -s -m 3 http://localhost:11434/api/tags -o /dev/null -w \"%{http_code}\\\\n\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:8099/)",
+      "Bash(curl -s -m 5 http://localhost:8000/)",
+      "Bash(netstat -ano)",
+      "Bash(curl -s http://localhost:8000/)",
+      "Bash(tasklist)",
+      "Bash(rm -f f:/AI/K2_PostTool/_grp.png /tmp/grp.py && echo cleaned)",
+      "Bash(f:/AI/K2_PostTool/.venv/Scripts/python.exe -m pip install --quiet yt-dlp)",
+      "Bash(f:/AI/K2_PostTool/.venv/Scripts/python.exe -c \"import yt_dlp; print\\('yt-dlp', yt_dlp.version.__version__\\)\")",
+      "Bash(timeout 45 f:/AI/K2_PostTool/.venv/Scripts/python.exe -c ' *)"
+    ],
+    "additionalDirectories": [
+      "\\tmp",
+      "F:\\AI\\K2_PostTool\\video_cache\\clips"
+    ]
+  }
+}

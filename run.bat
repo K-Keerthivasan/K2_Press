@@ -15,10 +15,16 @@ if not exist ".venv\Scripts\activate.bat" (
     exit /b 1
 )
 
-:: Check Ollama is running
-curl -s http://localhost:11434/api/tags >nul 2>&1
+:: Check the configured local AI backend
+if "%K2_LLM_BASE_URL%"=="hermes://cli" (
+    hermes --version >nul 2>&1
+) else if defined K2_LLM_BASE_URL (
+    curl -s "%K2_LLM_BASE_URL%/models" >nul 2>&1
+) else (
+    hermes --version >nul 2>&1
+)
 if errorlevel 1 (
-    echo [WARN] Ollama not detected — start it with: ollama serve
+    echo [WARN] Hermes CLI not detected. Start Hermes or set K2_LLM_BASE_URL to another endpoint.
     echo.
 )
 

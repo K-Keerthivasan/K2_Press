@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -20,6 +21,7 @@ class Story:
     summary: str
     url: str
     published: str
+    image: str = ""        # best image URL found in the feed entry (may be "")
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
@@ -92,6 +94,45 @@ def clean_text(value: str | None) -> str:
     return " ".join(str(value).split())
 
 
+def _entry_image(entry: dict) -> str:
+    """Best-effort article image straight from the RSS/Atom entry.
+
+    Order: media:content / media:thumbnail → image enclosure → first <img> in
+    the content/summary HTML. Returns "" when the entry carries no image (the
+    article-page og:image fallback handles those at fetch time).
+    """
+    # media:content may be a non-image (e.g. YouTube's media:content is the video
+    # player URL); skip those and let media:thumbnail provide the real image.
+    for media in entry.get("media_content") or []:
+        url = (media or {}).get("url")
+        if not url:
+            continue
+        medium = str((media or {}).get("medium") or "").lower()
+        mtype  = str((media or {}).get("type") or "").lower()
+        if medium == "video" or mtype.startswith("video") or "/v/" in url:
+            continue
+        return url.strip()
+    for media in entry.get("media_thumbnail") or []:
+        url = (media or {}).get("url")
+        if url:
+            return url.strip()
+
+    for link in entry.get("links") or []:
+        if link.get("rel") == "enclosure" and str(link.get("type", "")).startswith("image"):
+            if link.get("href"):
+                return link["href"].strip()
+
+    html = ""
+    content = entry.get("content")
+    if isinstance(content, list) and content:
+        html = content[0].get("value", "") or ""
+    html = html or entry.get("summary", "") or entry.get("description", "") or ""
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.I)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
 def normalize_entry(entry: dict) -> Story:
     title = clean_text(entry.get("title"))
     summary = clean_text(entry.get("summary") or entry.get("description"))
@@ -103,6 +144,7 @@ def normalize_entry(entry: dict) -> Story:
         summary=summary,
         url=url,
         published=published,
+        image=_entry_image(entry),
     )
 
 

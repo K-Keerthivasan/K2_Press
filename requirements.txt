@@ -9,3 +9,5 @@ requests
 openai
 Pillow
 pytrends
+PyMySQL
+yt-dlp

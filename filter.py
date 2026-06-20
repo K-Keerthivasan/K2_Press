@@ -19,6 +19,7 @@ class ScoredStory:
     summary: str
     url: str
     published: str
+    image: str = ""
 
 
 def _load_profile() -> str:
@@ -48,6 +49,7 @@ def _score_one(story: Story, profile: str, brand_name: str = "the brand",
         summary=story.summary,
         url=story.url,
         published=story.published,
+        image=story.image,
     )
 
 

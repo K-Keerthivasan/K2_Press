@@ -76,13 +76,14 @@ def _story(term: str, entities: str, label: str, rank: int, n: int) -> dict:
         "summary":   summary,
         "url":       _news_url(term),
         "published": "",
+        "image":     "",       # pytrends terms have no article image
         "score":     score,
         "reason":    f"🔥 Trending on Google · {label}",
     }
 
 
 def _news_story(title: str, summary: str, url: str, published: str,
-                label: str, rank: int, n: int) -> dict:
+                label: str, rank: int, n: int, image: str = "") -> dict:
     score = max(50, 96 - int(rank * (46 / max(1, n))))
     # Google News summaries are HTML lists of related-article links — strip tags,
     # and if nothing substantive survives, give the planner topic guidance instead.
@@ -95,6 +96,7 @@ def _news_story(title: str, summary: str, url: str, published: str,
         "summary":   clean[:900],
         "url":       url,
         "published": published or "",
+        "image":     image or "",
         "score":     score,
         "reason":    f"🔥 Trending · {label} (Google News)",
     }
@@ -128,11 +130,11 @@ def _google_news_stories(prof: dict, count: int) -> list[dict]:
         if not key or key in seen:
             continue
         seen.add(key)
-        out.append((s.title, s.summary, s.url, s.published))
+        out.append((s.title, s.summary, s.url, s.published, s.image))
         if len(out) >= count:
             break
-    return [_news_story(t, sm, u, p, label, i, len(out))
-            for i, (t, sm, u, p) in enumerate(out)]
+    return [_news_story(t, sm, u, p, label, i, len(out), image=img)
+            for i, (t, sm, u, p, img) in enumerate(out)]
 
 
 def trending_stories(brand_key: str | None = None, count: int = 15) -> list[dict]:

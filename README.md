@@ -9,7 +9,7 @@ Includes a live template editor and a drag-and-drop canvas design tool.
 | Layer | Tool |
 |---|---|
 | Feed ingestion | feedparser |
-| LLM (local) | Ollama — `qwen3:8b` / `gemma` (switchable in the UI) |
+| LLM | Hermes CLI by default, or any OpenAI-compatible local server |
 | Images | Pexels + Unsplash APIs, or any image URL |
 | Templating | Jinja2 |
 | Rendering | Playwright / headless Chromium |
@@ -20,7 +20,7 @@ Includes a live template editor and a drag-and-drop canvas design tool.
 
 ## Quick start
 
-Double-click **`run.bat`** — it activates the venv, checks Ollama, launches the server, and
+Double-click **`run.bat`** — it activates the venv, checks the local model setup, launches the server, and
 opens your browser at `http://localhost:8000`.
 
 ### First-time setup
@@ -34,7 +34,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 playwright install chromium
-ollama pull qwen3:8b      # or your preferred model
+hermes status             # confirm Hermes is logged in and ready
 ```
 
 Add API keys to `.env`:
@@ -51,8 +51,8 @@ docker compose up --build
 ```
 
 Open `http://localhost:8000`. The compose setup maps `outputs/`, `image_cache/`, and
-`library/` back to the project folder, and points containerized Ollama requests to
-`http://host.docker.internal:11434/v1`.
+`library/` back to the project folder. For Ollama-based Docker runs, point
+`llm.base_url` at `http://host.docker.internal:11434/v1`.
 
 ### Docker + Tailscale
 
@@ -84,7 +84,7 @@ On your phone or another device logged into the same tailnet, open the shown
 ## Using the app
 
 1. **Stories** — pick a feed category (Web Dev / Marketing / Tech), set how many to fetch and
-   keep, then **Fetch & Score**. Ollama ranks each story 0–100 (timed).
+   keep, then **Fetch & Score**. Your selected local AI model ranks each story 0–100 (timed).
    - **Single:** click **Edit as Carousel** to open one story in the Editor.
    - **Bulk:** tick 5–10 stories, choose the **formats** each should produce (Carousel / Square
      / Story / X), then **Generate All Selected**. The AI writes a plan + caption for every
@@ -117,7 +117,7 @@ You pick the model (top-right) and feed category per run; everything is timed.
 
 ```powershell
 python feeds.py  --limit 5                 # pull + print stories
-python filter.py --top 5                   # score with Ollama
+python filter.py --top 5                   # score with the configured LLM
 python plan.py   --total-slides 6          # generate a JSON plan
 python images.py "city skyline" --source unsplash
 python render.py --no-images               # render a carousel
@@ -136,7 +136,65 @@ Defined once in `static/brand.css`:
   `.bg-image` filter and `.slide::before` wash in `brand.css`.
 
 Edit `content_profile.md` to change what scores high. Edit `config.yaml` for feeds, slide-count
-rules, output size, and the LLM `base_url` (point it at a cloud model to switch off local).
+rules, output size, and the LLM `base_url`. The default backend is Hermes:
+
+```yaml
+llm:
+  base_url: "hermes://cli"
+  model:    "hermes:gpt-5.5"
+```
+
+You can still override the model endpoint at runtime:
+
+```powershell
+$env:K2_LLM_BASE_URL="hermes://cli"               # Hermes CLI backend
+$env:K2_LLM_MODEL="hermes:gpt-5.5"
+
+# Or use LM Studio / llama.cpp / Ollama OpenAI-compatible endpoint:
+$env:K2_LLM_BASE_URL="http://localhost:1234/v1"
+$env:K2_LLM_MODEL="local-model-name"
+$env:K2_LLM_API_KEY="not-needed-for-local"        # optional
+```
+
+**Switching engine at runtime:** the header has an **Engine** dropdown — flip between **Hermes**
+and **Ollama** live (no restart). Post generation runs on whichever engine is selected, and the
+Model dropdown refreshes to that engine's models. The selectable backends (and their host/model)
+are defined in `config.yaml` under `llm.backends`:
+
+```yaml
+llm:
+  backends:
+    hermes:
+      base_url: "hermes://cli"
+      model:    "hermes:gpt-5.5"
+    ollama:
+      base_url: "http://localhost:11434/v1"
+      model:    "qwen3:8b"
+```
+
+The Agent tab uses native tool calls when the selected backend supports them. Hermes CLI and plain
+chat models use a JSON command protocol so the same fetch and generate tasks still work.
+
+### Managing post data in MySQL (optional)
+
+By default the generated-post / review queue is a JSON file (`library/review_queue.json`). To manage
+post data in **MySQL** instead, set the `K2_MYSQL_*` vars in `.env` (at minimum `K2_MYSQL_DB`):
+
+```
+K2_MYSQL_HOST=localhost
+K2_MYSQL_PORT=3306
+K2_MYSQL_USER=root
+K2_MYSQL_PASSWORD=...
+K2_MYSQL_DB=k2_posts
+```
+
+The app auto-creates a `posts` table on first use, with real `DATETIME` columns for the **created**
+and **approved** dates (so posts can be queried/sorted by date). If `K2_MYSQL_DB` is blank or MySQL
+is unreachable, it transparently falls back to the JSON queue.
+
+Brand personality lives in `config.yaml` under each brand's `personality` field. Post generation
+now performs a final personality edit pass that rewrites copy fields while preserving facts,
+formats, image queries, hashtags, handles, and output schema.
 
 ---
 
@@ -152,8 +210,8 @@ static/
   logo.png           K2 Digital Media logo
 templates/           title.html · content.html · outro.html · cover.html
 feeds.py             RSS/Atom ingestion (category-aware)
-filter.py            Ollama relevance scoring
-plan.py              Ollama post planning (strict JSON, 3–10 slides)
+filter.py            local AI relevance scoring
+plan.py              local AI post planning (strict JSON, 3–10 slides)
 images.py            Pexels / Unsplash / URL fetching + cache
 render.py            Jinja2 → HTML → Playwright → PNG
 llm.py               thin OpenAI-compatible client (model list + switch)
