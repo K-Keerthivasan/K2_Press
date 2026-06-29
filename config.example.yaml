@@ -1,0 +1,220 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Example configuration. Copy this file to `config.yaml` and edit it with your
+# own brand(s), feeds, and Postiz channels. `config.yaml` is gitignored so your
+# real details never get committed. The app auto-copies this file to config.yaml
+# on first run if one doesn't exist.
+# ─────────────────────────────────────────────────────────────────────────────
+
+app:
+  name: "My Studio"          # shown as the browser tab title
+
+# Which brand the app is currently posting for. Switch in the header dropdown.
+active_brand: demo
+
+# ── Postiz publisher ────────────────────────────────────────────────────────────
+# Pushes finished assets to a self-hosted/hosted Postiz instance → Instagram.
+# The API key is read from the env var named below (never hard-code it).
+postiz:
+  # base_url = your Postiz NEXT_PUBLIC_BACKEND_URL + "/public/v1".
+  # Local Docker (default compose, frontend on :4007):  http://localhost:4007/api/public/v1
+  # Hosted Postiz cloud:                                 https://api.postiz.com/public/v1
+  base_url: "http://localhost:4007/api/public/v1"
+  api_key_env: "POSTIZ_API_KEY"          # set this in .env (Postiz → Settings → Public API)
+  channels:
+    # Map each brand key (under `brands:`) to its Postiz Instagram integration.
+    # Get the id/name from: python postiz.py --list-channels
+    demo: "your-integration-id-or-name"
+  publish:
+    default_mode: "draft"        # draft | schedule | now
+    allow_now: false             # hard guard: refuse mode "now" unless explicitly true
+  rate_limit:
+    max_requests_per_hour: 30
+    safety_margin: 2
+  reel:
+    require_9x16: true
+    min_seconds: 5
+    max_seconds: 90
+
+# ── Video Reels mode (YouTube trailer → branded 9:16 carousel/reel) ─────────────
+video_reels:
+  default_clip_seconds: 4.0
+  scene_threshold: 0.4
+  allowlist: []                  # cleared YouTube channel_ids / RSS urls / video urls
+
+# ── Brands ────────────────────────────────────────────────────────────────────
+# Add as many brands as you like; each carries its own copy, theme, scoring
+# profile, and feeds. Templates are shared — only the brand vars + theme change.
+brands:
+
+  demo:
+    name:      "Your Brand"
+    short:     "YB"
+    author:    "Your Name"
+    handle:    "@yourbrand"
+    instagram: "yourbrand"
+    tagline:   "Your tagline goes here"
+    pitch:     "What you do, in one line."
+    services:  "Service 1 · Service 2 · Service 3"
+    location:  "Your City"
+    website:   "yourbrand.com"
+    email:     "hello@yourbrand.com"
+    category:  "YOUR NICHE"
+    logo_path: "static/logo.png"        # drop your logo here (circular mark works best)
+    hashtags:  ["yourbrand", "marketing", "socialmedia"]
+    theme:
+      navy:    "#0A0F1E"   # background base
+      navy2:   "#0C1426"
+      accent:  "#00B4C8"   # primary accent
+      accent2: "#00C896"   # secondary accent
+      text:    "#FFFFFF"
+    video:
+      enabled: true
+      color_grade:
+        overlay: "#0A0F1E"
+        opacity: 0.15
+      captions:
+        font_size:  54
+        text_color: "#FFFFFF"
+        box_opacity: 0.55
+        position:   0.74
+      hook_card:
+        enabled:    true
+        duration:   2.0
+        bg:         "#0A0F1E"
+        text_color: "#FFFFFF"
+        accent:     "#00B4C8"
+      end_card:
+        enabled:    true
+        duration:   3.0
+        bg:         "#0A0F1E"
+        text_color: "#FFFFFF"
+        accent:     "#00B4C8"
+        cta:        "Link in bio"
+    profile: >
+      Describe your niche, audience, and what kinds of stories should score high.
+      The local AI uses this to rank fetched stories 0-100. Be specific about what
+      to reward and what to penalise.
+    personality: >
+      Describe your brand voice. The AI rewrites copy in this voice on a final
+      pass. Mention tone, what to emphasise, and words/styles to avoid.
+    feeds:
+      categories:
+        tech:
+          name:    "Tech"
+          enabled: true
+          urls:
+            - "https://techcrunch.com/feed"
+            - "https://www.theverge.com/rss/index.xml"
+        marketing:
+          name:    "Marketing"
+          enabled: true
+          urls:
+            - "https://blog.hubspot.com/marketing/rss.xml"
+            - "https://searchengineland.com/feed"
+        youtube:
+          name:    "YouTube"
+          enabled: true
+          urls:
+            # Channel feed: https://www.youtube.com/feeds/videos.xml?channel_id=<ID>
+            - "https://www.youtube.com/feeds/videos.xml?channel_id=UC2Xd-TjJByJyK2w1zNwY0zQ"
+
+llm:
+  # Active backend on boot. Switch live in the header "Engine" dropdown.
+  # env K2_LLM_* still wins on boot. Hermes is a local CLI; Ollama is an HTTP server.
+  base_url: "hermes://cli"
+  model:    "hermes:gpt-5.5"
+  format:   "json"
+  backends:
+    hermes:
+      base_url: "hermes://cli"
+      model:    "hermes:gpt-5.5"
+    ollama:
+      base_url: "http://localhost:11434/v1"
+      model:    "qwen3:8b"
+
+output:
+  width:     1080
+  height:    1350
+  directory: "outputs"
+
+# Image sourcing: pexels, unsplash, google (needs GOOGLE_API_KEY + GOOGLE_CSE_ID
+# in .env). The filter is baked into web/Google images on download (Pillow).
+images:
+  filter:
+    enabled:    true
+    saturation: 0.85
+    brightness: 0.95
+    contrast:   1.05
+
+slides:
+  min_content_cards: 1    # min total = 3 (title + 1 + outro)
+  max_content_cards: 8    # max total = 10 (title + 8 + outro)
+  default_total:     4
+  short_story:
+    max_summary_words: 220
+    content_cards:     2
+  long_story:
+    min_summary_words: 221
+    content_cards:     4
+
+# Post formats. "carousel"/"listicle" are multi-slide; the rest are single cards.
+formats:
+  carousel:
+    name:   "Carousel"
+    width:  1080
+    height: 1350
+    type:   multi
+  cover:
+    name:     "Brand Cover"
+    width:    1080
+    height:   1350
+    type:     single
+    template: cover.html
+  square:
+    name:     "Square Post"
+    width:    1080
+    height:   1080
+    type:     single
+    template: square.html
+  story:
+    name:     "Story"
+    width:    1080
+    height:   1920
+    type:     single
+    template: story.html
+  x:
+    name:     "X / Twitter"
+    width:    1600
+    height:   900
+    type:     single
+    template: xpost.html
+  quote:
+    name:     "Quote / Stat"
+    width:    1080
+    height:   1350
+    type:     single
+    template: quote.html
+  comparison:
+    name:     "Comparison / VS"
+    width:    1080
+    height:   1350
+    type:     single
+    template: comparison.html
+  breaking:
+    name:     "Breaking / Hot Take"
+    width:    1080
+    height:   1350
+    type:     single
+    template: breaking.html
+  listicle:
+    name:   "Listicle / Top-N"
+    width:  1080
+    height: 1350
+    type:   multi
+  linkedin:
+    name:     "LinkedIn"
+    width:    1200
+    height:   1200
+    type:     single
+    template: linkedin.html
+    # brands: ["demo"]   # uncomment to restrict a format to specific brand keys

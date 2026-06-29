@@ -171,7 +171,11 @@ def _messages_to_prompt(messages: list[dict], *, json_only: bool = False) -> str
 
 
 def _hermes_model_arg(model: str) -> str | None:
-    if model in {"", "hermes", "hermes-cli"}:
+    # Only honour explicit Hermes model names ("hermes:<x>"). A stale non-Hermes
+    # model (e.g. an Ollama "qwen3:8b" left selected in the UI) must NOT be passed
+    # as `hermes -m qwen3:8b` — that makes Hermes produce no final response and
+    # fails every call. Fall back to Hermes' own default instead.
+    if not model or not model.startswith("hermes:"):
         return None
     return model.removeprefix("hermes:")
 

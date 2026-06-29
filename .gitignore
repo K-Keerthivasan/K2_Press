@@ -4,6 +4,10 @@
 !.env.example
 !.env.tailscale.example
 
+# ── Personal config (your real brands, channels, keys) ─────────
+# config.example.yaml is the committed generic template; config.yaml is yours.
+config.yaml
+
 # ── Python ─────────────────────────────────────────────────────
 .venv/
 venv/

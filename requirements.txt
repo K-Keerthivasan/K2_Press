@@ -11,3 +11,4 @@ Pillow
 pytrends
 PyMySQL
 yt-dlp
+python-multipart

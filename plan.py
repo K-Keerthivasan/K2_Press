@@ -492,21 +492,41 @@ def plan_post(
     brand: dict | None = None,
     tone: str = "",
 ) -> dict:
-    """Dispatch: carousel -> multi-slide plan; everything else -> single-card plan."""
+    """Dispatch: carousel -> multi-slide plan; everything else -> single-card plan.
+
+    Always returns a plan with a non-empty caption (filled from content if the
+    model left it blank), so saved/published posts never need a manual regen."""
+    if fmt == "cover":
+        # The brand-cover card is purely static brand furniture — no LLM call.
+        return {"format": "cover", "slug": "brand-cover"}
     if fmt == "carousel":
         plan = plan_story(story, config, total_slides=total_slides, model=model,
                           brand=brand, tone=tone)
         plan.setdefault("format", "carousel")
-        return plan
-    if fmt == "listicle":
-        return plan_listicle(story, config, total_slides=total_slides, model=model,
+    elif fmt == "listicle":
+        plan = plan_listicle(story, config, total_slides=total_slides, model=model,
                              brand=brand, tone=tone)
-    if fmt in _SPECIAL_FORMATS:
-        return plan_special(story, fmt, config=config, model=model, brand=brand, tone=tone)
-    if fmt == "cover":
-        # The brand-cover card is purely static brand furniture — no LLM call.
-        return {"format": "cover", "slug": "brand-cover"}
-    return plan_single(story, fmt, config=config, model=model, brand=brand, tone=tone)
+    elif fmt in _SPECIAL_FORMATS:
+        plan = plan_special(story, fmt, config=config, model=model, brand=brand, tone=tone)
+    else:
+        plan = plan_single(story, fmt, config=config, model=model, brand=brand, tone=tone)
+    return _ensure_caption(plan, brand=brand, config=config, model=model, tone=tone)
+
+
+def _ensure_caption(plan: dict, *, brand=None, config=None, model=None, tone="") -> dict:
+    """Guarantee a non-empty caption. If the generator left it blank, fill it
+    (and hashtags, if missing) from the plan's own content via regen_caption."""
+    if (plan.get("caption") or "").strip():
+        return plan
+    try:
+        out = regen_caption(plan, brand=brand, config=config, model=model, tone=tone)
+        if out.get("caption"):
+            plan["caption"] = out["caption"]
+        if out.get("hashtags") and not plan.get("hashtags"):
+            plan["hashtags"] = out["hashtags"]
+    except Exception as e:
+        print(f"[plan] caption fallback failed: {e}")
+    return plan
 
 
 def regen_caption(plan: dict, brand: dict | None = None, config: dict | None = None,

@@ -1,7 +1,9 @@
-# K2 Digital Media — Carousel Generator
+# K2 Press — Multi-Brand Carousel & Reel Generator
 
-Turn RSS/news feeds into branded Instagram carousel posts — automatically planned,
-image-fetched, and rendered to 1080×1350 PNGs using HTML/CSS templates and a headless browser.
+Turn RSS/news feeds (and YouTube trailers) into branded Instagram posts — automatically
+planned, image-fetched, and rendered to PNGs/9:16 video using HTML/CSS templates and a
+headless browser, then published to Instagram via Postiz. Multi-brand and fully
+config-driven — copy `config.example.yaml` to `config.yaml` and add your own brands.
 Includes a live template editor and a drag-and-drop canvas design tool.
 
 ## Tech stack
@@ -43,6 +45,23 @@ Add API keys to `.env`:
 PEXELS_API_KEY=your_pexels_key        # free at pexels.com/api
 UNSPLASH_API_KEY=your_unsplash_key    # optional, free at unsplash.com/developers
 ```
+
+### Configure your brand(s)
+
+Nothing in the app is hard-coded to a specific brand — all identity (name, handle,
+logo, theme, feeds, Postiz channel) is config-driven. Copy the example config and
+edit it:
+
+```powershell
+copy config.example.yaml config.yaml      # (the app also auto-copies it on first run)
+```
+
+Then open `config.yaml` and set your `app.name`, your brand block(s) under `brands:`
+(name, handle, logo, theme colours, scoring `profile`/`personality`, and feed URLs),
+and your Postiz `channels` (run `python postiz.py --list-channels` to get the ids).
+Drop your logo at the `logo_path` you set (e.g. `static/logo.png`). `config.yaml` is
+**gitignored**, so your real details and keys never get committed — only the generic
+`config.example.yaml` template is tracked.
 
 ### Docker
 
@@ -121,7 +140,73 @@ python filter.py --top 5                   # score with the configured LLM
 python plan.py   --total-slides 6          # generate a JSON plan
 python images.py "city skyline" --source unsplash
 python render.py --no-images               # render a carousel
+python postiz.py --list-channels           # list Postiz integrations
+python video_reels.py --rss "<feed>" --emit-manifest m.json   # YouTube → 9:16 manifest
 ```
+
+---
+
+## Publishing to Instagram (Postiz)
+
+Finished assets are pushed to a self-hosted **Postiz** instance, which posts to
+Instagram via the Meta Graph API. K2 renders nothing here — it hands Postiz the
+finished carousel / single post / reel / story plus a caption. Default mode is
+**draft**: you review the queue in the Postiz calendar, then publish.
+
+**From the app:** in the **Review** tab, **Approve** pushes the post to Postiz as
+a draft (falls back to the `N8N_WEBHOOK_URL` webhook if `POSTIZ_API_KEY` is unset,
+so the queue still works standalone). When `PUBLIC_BASE_URL` is set, Postiz fetches
+the bytes over HTTP (`/upload-from-url`); otherwise local files are uploaded.
+
+**From the CLI** (`postiz.py`, the engine without the UI):
+
+```powershell
+python postiz.py --type carousel --asset s1.png --asset s2.png --caption cap.txt
+python postiz.py --type post  --asset card.png --caption "Hello 👋"
+python postiz.py --type reel  --asset reel.mp4 --caption cap.txt --dry-run
+python postiz.py --type story --asset card.png --mode draft
+```
+
+`--mode` is `draft | schedule | now` (default from config). `now` is hard-guarded
+behind `postiz.publish.allow_now`; `schedule` requires `--date` (ISO8601). `--dry-run`
+builds and prints the payload without POSTing. The 30-requests/hour Postiz ceiling is
+accounted for up front (a 5-slide carousel = 6 requests; a reel = 2).
+
+Config lives in `config.yaml` under `postiz:` (instance URL, per-brand `channels`,
+modes, rate limit, reel specs). The API key is read from `POSTIZ_API_KEY` in `.env`
+(Postiz → Settings → Public API). The IG account must be Business/Creator. On the
+**Instagram Standalone** integration a reel is sent as a `post` (a 9:16 video is
+published as a Reel by Instagram itself) — the publisher handles this automatically.
+
+---
+
+## YouTube Reels & Video-Carousel (`video_reels` mode)
+
+Turn a YouTube trailer into branded **9:16** content (hook → title → CTA cards) and
+ship it as a **video carousel** or a single stitched **reel**, gated through Postiz
+as a draft. The **manifest** (JSON) is the edit surface: generate it, hand-edit the
+clips/copy/highlights, then render. Engine + CLI: `video_reels.py`. Rights-gated —
+yt-dlp downloads only when a source is cleared.
+
+```powershell
+# 1. Generate a manifest (RSS poll → LLM copy → clip pick), then stop to edit:
+python video_reels.py --rss "<channel_feed_url>" --mode carousel --emit-manifest m.json
+#    ...edit m.json: swap clip.start, rewrite text, toggle highlight, set output_mode,
+#    and set source.rights_cleared: true (you assert rights) ...
+# 2. Render + push to Postiz as a draft:
+python video_reels.py --from-manifest m.json --send
+```
+
+- `--mode carousel|reel`, `--clip-method even_intervals|scene_cut|manual`, `--cards 3`,
+  `--video-id <id>` (instead of `--rss`), `--dry-run` (build manifest, no write/post).
+- Clip methods always pick **different** moments per card. `scene_cut` uses ffmpeg
+  scene detection and needs the source downloaded (so it requires clearance up front).
+- Rights: a source is cleared if `source.rights_cleared: true` in the manifest, or its
+  channel id / RSS url / video url is in `config.yaml` `video_reels.allowlist`.
+- Templates: `templates/vr_hook.html` · `vr_title.html` · `vr_cta.html` (K2 navy/teal/
+  green, logo + handle, keyword highlights) — rendered to transparent PNGs and
+  composited over the clip by ffmpeg. `config.yaml` → `video_reels:` for clip length,
+  scene threshold, and the allowlist.
 
 ---
 
@@ -215,6 +300,7 @@ plan.py              local AI post planning (strict JSON, 3–10 slides)
 images.py            Pexels / Unsplash / URL fetching + cache
 render.py            Jinja2 → HTML → Playwright → PNG
 llm.py               thin OpenAI-compatible client (model list + switch)
+postiz.py            Postiz publisher — engine + k2publish CLI (Instagram drafts)
 app.py               FastAPI control panel, canvas, template editor
 image_cache/         downloaded images
 outputs/             rendered carousels

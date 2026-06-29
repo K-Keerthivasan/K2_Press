@@ -60,7 +60,7 @@ def rank_stories(stories: list[Story], top_n: int = 5, model: str | None = None,
         brand_name = brand.get("name", "the brand")
     else:
         profile    = _safe_profile()
-        brand_name = "K2 Digital Media"
+        brand_name = "the brand"
     scored: list[ScoredStory] = []
     for s in stories:
         if should_cancel and should_cancel():

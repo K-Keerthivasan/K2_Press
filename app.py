@@ -1,4 +1,8 @@
-"""K2 Digital Media — carousel generator with live editor and canvas design tool."""
+"""Multi-brand carousel/reel generator with live editor and canvas design tool.
+
+Brand identity (name, handle, theme, feeds, Postiz channel) is config-driven —
+see config.yaml (copy config.example.yaml to start). Nothing here is specific to
+any one brand."""
 from __future__ import annotations
 import asyncio
 import json
@@ -12,15 +16,29 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, UploadFile, File
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Fresh clones ship config.example.yaml (a generic demo brand) but not config.yaml
+# (which holds the user's real brands and is gitignored). Copy the example on first
+# run so every module — all of which read config.yaml — works out of the box.
+if not Path("config.yaml").exists() and Path("config.example.yaml").exists():
+    shutil.copy("config.example.yaml", "config.yaml")
+
+
+def _app_name() -> str:
+    try:
+        return (yaml.safe_load(open("config.yaml", encoding="utf-8")) or {}).get("app", {}).get("name") or "Studio"
+    except Exception:
+        return "Studio"
+
+
 # ── App setup ─────────────────────────────────────────────────────────────────
-app = FastAPI(title="K2 Digital Media")
+app = FastAPI(title=_app_name())
 
 for _d in ("outputs", "image_cache", "library", "library/plans", "library/stories",
            "video_cache", "video_cache/out", "video_cache/clips", "video_cache/tmp"):
@@ -751,13 +769,64 @@ def _review_enqueue(posts: list[dict]) -> list[dict]:
     return added
 
 
+_VIDEO_EXTS = (".mp4", ".mov", ".m4v")
+
+
+def _postiz_type(entry: dict) -> str:
+    """Map a K2 review entry (format + files) to a Postiz content type."""
+    files = entry.get("files", [])
+    if files and files[0].lower().endswith(_VIDEO_EXTS):
+        return "reel"
+    fmt = (entry.get("format") or "").lower()
+    if fmt == "carousel" or len(files) > 1:
+        return "carousel"
+    if fmt == "story":
+        return "story"
+    return "post"            # square / xpost / single → single IG post
+
+
+def _postiz_publish(entry: dict) -> dict:
+    """Publish an approved post to Postiz as a draft. Prefers /upload-from-url
+    when PUBLIC_BASE_URL is set (so a remote/Dockerized Postiz can fetch the
+    bytes), else uploads the local files. No-op (sent=False) when the Postiz API
+    key is unset, so the queue still works standalone."""
+    import postiz
+    cfg = postiz.load_config(_cfg())
+    if not os.environ.get(cfg.get("api_key_env", "POSTIZ_API_KEY"), "").strip():
+        return {"sent": False, "reason": "POSTIZ_API_KEY not set"}
+    files, rel = entry.get("files", []), entry.get("rel", "")
+    if not files or not rel:
+        return {"sent": False, "reason": "no assets to publish"}
+    ptype = _postiz_type(entry)
+    chan = entry.get("brand") or "instagram"   # route each brand to its own IG integration
+    base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    try:
+        if base:
+            urls = [f"{base}/outputs/{rel}/{f}" for f in files]
+            res = postiz.publish(type=ptype, assets=[], asset_urls=urls, channel=chan,
+                                 caption=entry.get("caption", ""), mode="draft", config=_cfg())
+        else:
+            paths = [str(Path("outputs") / rel / f) for f in files]
+            res = postiz.publish(type=ptype, assets=paths, channel=chan,
+                                 caption=entry.get("caption", ""), mode="draft", config=_cfg())
+        return {"sent": True, "via": "postiz", "post_id": res.get("post_id"),
+                "post_type": res.get("post_type")}
+    except Exception as e:
+        return {"sent": False, "via": "postiz", "error": str(e)}
+
+
 def _sync_publish(entry: dict) -> dict:
-    """POST the approved post to the configured n8n webhook. No-op (but still
-    marks approved) if N8N_WEBHOOK_URL is unset, so the queue works standalone."""
+    """Publish an approved post. Tries Postiz first (when POSTIZ_API_KEY is set),
+    else falls back to the configured n8n webhook. No-op (but still marks
+    approved) if neither is configured, so the queue works standalone."""
     import requests
+    pz = _postiz_publish(entry)
+    if pz.get("sent") or pz.get("via") == "postiz":
+        return pz                       # Postiz handled it (success or real error)
+
     url = os.environ.get("N8N_WEBHOOK_URL", "").strip()
     if not url:
-        return {"sent": False, "reason": "N8N_WEBHOOK_URL not set"}
+        return {"sent": False, "reason": "POSTIZ_API_KEY / N8N_WEBHOOK_URL not set"}
     base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
     images = [f"{base}/outputs/{entry['rel']}/{f}" for f in entry.get("files", [])]
     payload = {
@@ -771,9 +840,9 @@ def _sync_publish(entry: dict) -> dict:
     try:
         r = requests.post(url, json=payload, timeout=20)
         r.raise_for_status()
-        return {"sent": True, "status": r.status_code}
+        return {"sent": True, "via": "n8n", "status": r.status_code}
     except Exception as e:
-        return {"sent": False, "error": str(e)}
+        return {"sent": False, "via": "n8n", "error": str(e)}
 
 
 @app.get("/api/review")
@@ -816,6 +885,28 @@ async def api_review_delete(rid: str):
     items = [i for i in _review_load() if i.get("id") != rid]
     _review_save(items)
     return {"ok": True}
+
+
+@app.post("/api/review/enqueue")
+async def api_review_enqueue(body: dict = Body(default={})):
+    """Push an already-rendered post into the review queue. Used by the Editor's
+    and Bulk results' 'Send to Review' buttons so manually-previewed posts can be
+    approved → drafted to Postiz, the same as Agent/autopilot output. Body is a
+    post dict: {brand, title, format, rel, files, caption}."""
+    b = body or {}
+    rel   = (b.get("rel") or "").strip()
+    files = [f for f in (b.get("files") or []) if (Path("outputs") / rel / f).is_file()]
+    if not rel or not files:
+        raise HTTPException(400, "No rendered files found for this post.")
+    added = _review_enqueue([{
+        "brand":   b.get("brand"),
+        "title":   b.get("title") or "",
+        "format":  b.get("format") or "carousel",
+        "rel":     rel,
+        "files":   files,
+        "caption": b.get("caption") or "",
+    }])
+    return {"ok": True, "added": added}
 
 
 @app.post("/api/review/clear")
@@ -1044,8 +1135,12 @@ async def api_lib_save_plan(body: dict = Body(default={})):
              "when": datetime.now().isoformat(timespec="seconds")}
     dest  = LIB_PLANS / bkey
     dest.mkdir(parents=True, exist_ok=True)
+    # Persist the fetched images too, so a reloaded plan is render-ready without
+    # re-fetching. Stored as the same {slide_idx: image_cache path} session map.
+    image_paths = body.get("image_paths") or _session.get("image_paths", {})
     (dest / f"{fid}.json").write_text(
-        json.dumps({"meta": meta, "plan": plan}, ensure_ascii=False, indent=2), encoding="utf-8")
+        json.dumps({"meta": meta, "plan": plan, "image_paths": image_paths},
+                   ensure_ascii=False, indent=2), encoding="utf-8")
     return {"ok": True, "id": fid, "meta": meta}
 
 
@@ -1060,8 +1155,13 @@ async def api_lib_get_plan(fid: str):
     if not f:
         raise HTTPException(404, fid)
     data = json.loads(f.read_text(encoding="utf-8"))
-    _session["plan"]        = data.get("plan")
-    _session["image_paths"] = {}
+    _session["plan"] = data.get("plan")
+    # Restore the saved images (drop any whose cached file is gone), so the
+    # reloaded plan renders as-saved with no re-fetch.
+    saved_imgs = data.get("image_paths") or {}
+    _session["image_paths"] = {k: v for k, v in saved_imgs.items()
+                              if v and Path(v).exists()}
+    data["image_paths"] = _session["image_paths"]
     return data
 
 
@@ -1389,6 +1489,26 @@ async def api_image_from_url(body: dict = Body(...)):
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/images/upload/{slide_idx}")
+async def api_image_upload(slide_idx: int, file: UploadFile = File(...)):
+    """Upload a local image for a slide. Saved to image_cache and set as the
+    slide's background (same session map render/preview read)."""
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        raise HTTPException(400, "Image must be .jpg, .png, or .webp")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty file")
+    import hashlib
+    fid  = hashlib.md5(data).hexdigest()[:10]
+    dest = Path("image_cache") / f"up-{slide_idx}-{fid}{ext}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    path = dest.as_posix()
+    _session["image_paths"][str(slide_idx)] = path
+    return {"path": path, "filename": dest.name}
+
+
 @app.delete("/api/images/{slide_idx}")
 async def api_clear_image(slide_idx: int):
     _session["image_paths"].pop(str(slide_idx), None)
@@ -1565,17 +1685,17 @@ def _dummy_plan():
         "slug": "preview",
         "slide_count": 4,
         "title_card": {
-            "headline": "3 Ways K2 Digital Media Grows London Businesses",
-            "subhead":  "Local strategy, real results — no fluff.",
+            "headline": "3 Ways To Grow Your Brand Online",
+            "subhead":  "A sample plan — edit every line, then render.",
         },
         "content_slides": [
-            {"heading": "LOCAL INSIGHT", "body": "— We know London's market inside out.\n— Your competitors don't get this playbook.", "image_query": "London Ontario city"},
-            {"heading": "FULL STACK", "body": "— Web, video, marketing, IT — one team.\n— No hand-offs, no finger-pointing.", "image_query": "digital team working"},
+            {"heading": "KNOW YOUR AUDIENCE", "body": "— Speak to one person, not everyone.\n— Lead with the problem you solve.", "image_query": "audience engagement"},
+            {"heading": "BE CONSISTENT", "body": "— Show up on a steady schedule.\n— One clear message per post.", "image_query": "content calendar desk"},
         ],
-        "outro_card": {"cta": "Follow for weekly London business insight", "handle": "@k2digitalmedia_"},
-        "caption": "London's local business scene is moving fast.",
-        "hashtags": ["london", "ontario", "digitalmedia"],
-        "dm_keyword": "GROW",
+        "outro_card": {"cta": "Follow for more tips", "handle": "@yourbrand"},
+        "caption": "A sample caption — replace this with your own.",
+        "hashtags": ["yourbrand", "marketing", "socialmedia"],
+        "dm_keyword": "INFO",
     }
 
 
@@ -1584,7 +1704,8 @@ def _dummy_plan():
 async def index():
     # Never cache the UI — otherwise the browser can serve a stale build (e.g.
     # an old brand switcher) and quietly use the wrong brand.
-    return HTMLResponse(FRONTEND_HTML, headers={
+    html = FRONTEND_HTML.replace("__APP_NAME__", _app_name())
+    return HTMLResponse(html, headers={
         "Cache-Control": "no-store, no-cache, must-revalidate",
         "Pragma": "no-cache",
     })
@@ -1595,7 +1716,7 @@ FRONTEND_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>K2 Digital Media</title>
+<title>__APP_NAME__</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/xml/xml.min.js"></script>
@@ -1663,6 +1784,8 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 .tab.active{display:flex;}
 /* ═══ STORIES TAB ══════════════════════════════════════════════════════════ */
 #tab-stories{flex-direction:column;}
+/* Review stacks its toolbar above the post list (default .tab is row). */
+#tab-review{flex-direction:column;}
 .stories-toolbar{display:flex;align-items:center;gap:8px;padding:12px 18px;border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;}
 /* Keep a label glued to its control so they wrap together, not as loose items. */
 .tb-group{display:inline-flex;align-items:center;gap:5px;flex-shrink:0;margin:0;}
@@ -2341,7 +2464,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 <div id="tab-review" class="tab">
   <div class="stories-toolbar" style="flex-wrap:wrap;">
     <b style="font-size:14px;color:#fff;">✅ Review &amp; publish</b>
-    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Approve to publish via n8n; reject to discard. Agent &amp; autopilot posts land here.</span>
+    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Approve to publish as a Postiz draft (or n8n); reject to discard. Agent &amp; autopilot posts land here.</span>
     <div class="tb-spacer"></div>
     <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Show</span>
     <select id="review-filter" class="src-sel" onchange="loadReview()">
@@ -2492,6 +2615,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
       <h3>Plan Editor</h3>
       <button class="btn btn-ghost btn-sm" onclick="savePlan()" title="Save this plan to your library">💾 Save</button>
       <button class="btn btn-ghost btn-sm" onclick="openLibrary()" title="Load a saved plan">📂 Library</button>
+      <button class="btn btn-ghost btn-sm" id="btn-source" onclick="viewSource()" title="Open the original article this post was generated from">🔗 Original</button>
       <select id="slide-count-sel" style="background:#0d1828;border:1px solid var(--border);border-radius:5px;color:#fff;padding:3px 6px;font-size:12px;font-family:inherit;">
         <option value="3">3 slides</option>
         <option value="4" selected>4 slides</option>
@@ -2565,7 +2689,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
         <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="addText('Headline',72,'bold')">+ Headline</button>
         <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="addText('Subheading',44,'bold')">+ Subheading</button>
         <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="addText('Body text goes here',32,'normal')">+ Body Text</button>
-        <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="addText('@k2digitalmedia_',22,'bold')">+ Handle</button>
+        <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="addText(_bi().handle||'@handle',22,'bold')">+ Handle</button>
         <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="addRect()">+ Dark Panel</button>
         <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="addRule()">+ Teal Rule</button>
         <button class="btn btn-ghost btn-sm" style="justify-content:flex-start;" onclick="addLogo()">+ Logo Badge</button>
@@ -2783,6 +2907,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   applySettings();          // apply saved defaults now that controls/options exist
   await restoreSession();
   refreshReviewBadge();     // show any pending posts awaiting review
+  restoreActiveTab();       // re-open the last tab after a refresh
   refreshResponsiveSurfaces();
 });
 window.addEventListener('resize', refreshResponsiveSurfaces);
@@ -3032,8 +3157,18 @@ function showTab(name, btn) {
   if (name === 'scripts') refreshScriptStorySelect();
   if (name === 'video') refreshVideoScriptSelect();
   if (name === 'review') loadReview();
+  try { localStorage.setItem('k2_active_tab', name); } catch(e) {}   // remember across refresh
   toggleNav(false);   // collapse the mobile drawer after picking a tab
   requestAnimationFrame(refreshResponsiveSurfaces);
+}
+
+// Re-open the tab the user was last on (survives a page refresh).
+function restoreActiveTab() {
+  let name = '';
+  try { name = localStorage.getItem('k2_active_tab') || ''; } catch(e) {}
+  if (!name || name === 'stories') return;          // stories is the default
+  const btn = document.querySelector(`.nav-btn[onclick*="showTab('${name}'"]`);
+  if (btn) showTab(name, btn);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3323,8 +3458,8 @@ async function approveReview(id, btn) {
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
   try {
     const r = await api('/api/review/' + id + '/approve', 'POST');
-    if (r.publish && r.publish.sent) toast('Published ✓');
-    else if (r.publish && r.publish.reason) toast('Approved — set N8N_WEBHOOK_URL to auto-publish');
+    if (r.publish && r.publish.sent) toast('Published ✓ ' + (r.publish.via === 'postiz' ? 'draft in Postiz' : ''));
+    else if (r.publish && r.publish.reason) toast('Approved — set POSTIZ_API_KEY to auto-draft');
     else if (r.publish && r.publish.error) toast('Approved, publish failed: ' + r.publish.error, 'err');
     else toast('Approved');
     loadReview();
@@ -3583,6 +3718,7 @@ function resultCard(ri) {
       <div class="story-actions" style="margin-top:8px;flex-wrap:wrap;">
         ${isCarousel ? `<button class="btn btn-primary btn-sm" onclick="editResultPlan(${ri})">✎ Edit in Editor</button>`
                      : `<button class="btn btn-green btn-sm" onclick="suggestForResult(${ri})">✨ Suggest images</button>`}
+        <button class="btn btn-green btn-sm" onclick="sendResultToReview(${ri}, this)">✓ Send to Review</button>
         <a href="/outputs/${r.rel}/" target="_blank" class="btn btn-ghost btn-sm">Open folder ↗</a>
       </div>
     </div>`;
@@ -3926,6 +4062,9 @@ function renderForm(plan) {
           <input class="url-inp" id="f-iq-${i}" value="${esc(sl.image_query||'')}" placeholder="search images…" style="flex:1">
           <button class="btn btn-ghost btn-sm" onclick="searchImagesFor(${i})" title="Search and pick from a grid">🔍 Search</button>
           <button class="btn btn-ghost btn-sm" onclick="swapImage(${i})" title="Auto-use the top result">Swap</button>
+          <button class="btn btn-ghost btn-sm" onclick="document.getElementById('f-up-${i}').click()" title="Upload an image from your computer">⬆ Upload</button>
+          <button class="btn btn-ghost btn-sm" onclick="removeImage(${i})" title="Remove image (blank background)">✕</button>
+          <input type="file" id="f-up-${i}" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="uploadImage(${i}, this)">
         </div>
       </div>
       <div class="field-group"><label>Image from URL</label>
@@ -4124,6 +4263,33 @@ async function swapImage(idx) {
   } catch(e){toast(e.message,'err');}
 }
 
+async function removeImage(idx) {
+  try {
+    await api(`/api/images/${idx}`, 'DELETE');
+    delete S.imagePaths[idx];
+    delete S.imagePaths[String(idx)];
+    const el = g(`thumb-${idx}`);
+    if (el) el.outerHTML = `<div class="img-thumb empty" id="thumb-${idx}">🖼</div>`;
+    toast(`Slide ${idx+1} image removed`);
+    if (S.slideIdx === idx+1) showSlidePreview(idx+1);   // refresh preview if open
+  } catch(e){ toast(e.message,'err'); }
+}
+
+async function uploadImage(idx, input) {
+  const f = input.files && input.files[0];
+  if (!f) return;
+  const fd = new FormData(); fd.append('file', f);
+  try {
+    const r = await fetch(`/api/images/upload/${idx}`, {method:'POST', body:fd})
+      .then(r => { if(!r.ok) return r.json().then(j=>{throw new Error(j.detail||'upload failed')}); return r.json(); });
+    S.imagePaths[idx] = r.path;
+    setThumb(idx, '/image_cache/' + r.filename);
+    toast(`Slide ${idx+1} image uploaded`);
+    showSlidePreview(idx+1);
+  } catch(e){ toast(e.message,'err'); }
+  finally { input.value = ''; }   // allow re-uploading the same file
+}
+
 async function imgFromUrl(idx) {
   const url = g(`f-url-${idx}`)?.value||'';
   if(!url){toast('Enter an image URL','err');return;}
@@ -4228,12 +4394,16 @@ async function renderFull() {
     document.getElementById('hdr-timer').textContent=data.elapsed+'s';
     toast(`✓ Rendered ${data.files.length} slides in ${data.elapsed}s`);
     notify('Carousel rendered', `${data.files.length} slides saved in ${data.elapsed}s`);
+    S.lastRender = {rel:data.rel, files:data.files};
     g('preview-wrap').innerHTML=`
       <div style="text-align:center;padding:16px;line-height:1.8;">
         <div style="font-size:16px;font-weight:700;color:var(--green);margin-bottom:6px;">Carousel saved!</div>
         <div style="font-size:12px;color:var(--muted);">${data.output_dir}</div>
         <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:6px;justify-content:center;">
           ${data.files.map(f=>`<a href="/outputs/${data.rel}/${f}" target="_blank" style="color:var(--teal);font-size:11px;">${f}</a>`).join('')}
+        </div>
+        <div style="margin-top:14px;">
+          <button class="btn btn-green btn-sm" onclick="sendEditorToReview(this)">✓ Send to Review</button>
         </div>
       </div>`;
   } catch(e){
@@ -4242,6 +4412,45 @@ async function renderFull() {
     notify('Render failed', e.message);
   } finally {
     btn.disabled=false; btn.innerHTML='Render Carousel';
+  }
+}
+
+// Push the just-rendered Editor carousel into the Review queue (→ approve → Postiz).
+async function sendEditorToReview(btn) {
+  if (!S.plan || !S.lastRender) { toast('Render a carousel first','err'); return; }
+  if (btn) { btn.disabled=true; btn.innerHTML='<span class="spin"></span>'; }
+  const p = S.plan;
+  try {
+    await api('/api/review/enqueue','POST',{
+      brand:   curBrand(),
+      title:   (p.title_card && p.title_card.headline) || p.slug || 'Untitled',
+      format:  p.format || 'carousel',
+      rel:     S.lastRender.rel,
+      files:   S.lastRender.files,
+      caption: p.caption || '',
+    });
+    toast('Sent to Review ✓');
+    if (btn) { btn.disabled=true; btn.innerHTML='✓ Sent to Review'; }
+  } catch(e) {
+    toast(e.message,'err');
+    if (btn) { btn.disabled=false; btn.innerHTML='✓ Send to Review'; }
+  }
+}
+
+// Push a Bulk/Batch result card into the Review queue.
+async function sendResultToReview(ri, btn) {
+  const r = S.results[ri];
+  if (!r || !r.ok) { toast('Nothing to send','err'); return; }
+  if (btn) { btn.disabled=true; btn.innerHTML='<span class="spin"></span>'; }
+  try {
+    await api('/api/review/enqueue','POST',{
+      brand:r.brand, title:r.title, format:r.format, rel:r.rel, files:r.files, caption:r.caption||''
+    });
+    toast('Sent to Review ✓');
+    if (btn) { btn.disabled=true; btn.innerHTML='✓ Sent'; }
+  } catch(e) {
+    toast(e.message,'err');
+    if (btn) { btn.disabled=false; btn.innerHTML='✓ Send to Review'; }
   }
 }
 
@@ -4280,10 +4489,10 @@ function initCanvas() {
 // Active brand info (with safe fallback) for canvas drawing.
 function _bi() {
   return S.brandInfo || {
-    name:'K2 Digital Media', short:'K2', handle:'@k2digitalmedia_',
-    tagline:'The complete online presence for local business',
-    pitch:'One agency. Four services.', services:'Web · Video · Marketing · IT',
-    location:'London, Ontario', website:'k2digitalmedia.ca', category:'WEB DEVELOPMENT',
+    name:'Your Brand', short:'YB', handle:'@yourbrand',
+    tagline:'Your tagline goes here',
+    pitch:'What you do, in one line.', services:'Service 1 · Service 2 · Service 3',
+    location:'Your City', website:'yourbrand.com', category:'YOUR NICHE',
     logo:'/static/logo.png', accent:'#00B4C8', accent2:'#00C896', navy:'#0A0F1E', text:'#FFFFFF',
   };
 }
@@ -4658,6 +4867,32 @@ async function previewTemplate() {
 function closeModal(){ g('modal-bg').style.display='none'; }
 function openModal(title){ g('modal-title').textContent=title; g('modal-bg').style.display='flex'; }
 
+// In-app text prompt (replaces the browser prompt()). Resolves to the entered
+// string, or null on cancel.
+function promptModal(title, label, defaultValue='', okLabel='Save'){
+  return new Promise(resolve => {
+    openModal(title);
+    const body = g('modal-body');
+    body.innerHTML = `
+      <label style="font-size:12px;color:var(--muted);">${label}</label>
+      <input id="prompt-input" class="url-inp" style="width:100%;font-size:14px;padding:10px 12px;margin-top:6px;">
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px;">
+        <button class="btn btn-ghost btn-sm" id="prompt-cancel">Cancel</button>
+        <button class="btn btn-green btn-sm" id="prompt-ok">${esc(okLabel)}</button>
+      </div>`;
+    const input = g('prompt-input');
+    input.value = defaultValue || '';
+    setTimeout(()=>{ input.focus(); input.select(); }, 30);
+    const done = (val)=>{ closeModal(); resolve(val); };
+    g('prompt-ok').onclick     = ()=> done(input.value.trim() || defaultValue);
+    g('prompt-cancel').onclick = ()=> done(null);
+    input.onkeydown = (e)=>{
+      if(e.key==='Enter'){ e.preventDefault(); done(input.value.trim() || defaultValue); }
+      else if(e.key==='Escape'){ done(null); }
+    };
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Settings panel — edit the defaults that get applied on every load.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4731,10 +4966,17 @@ function resetSettings() {
   toast('Reset to defaults');
 }
 
+function viewSource() {
+  const u = S.plan && (S.plan.source_url || S.plan.url);
+  if (!u) { toast('No original link for this plan (try generating from a story)','err'); return; }
+  window.open(u, '_blank', 'noopener');
+}
+
 async function savePlan() {
   if (!S.plan) { toast('No plan to save','err'); return; }
   syncPlan();
-  const name = prompt('Save plan as:', S.plan.title_card?.headline || S.plan.slug || 'plan');
+  const name = await promptModal('Save plan', 'Save this plan to your library as:',
+                                 S.plan.title_card?.headline || S.plan.slug || 'plan');
   if (name === null) return;
   try {
     await api('/api/library/plan','POST',{plan:S.plan, name});
@@ -4769,10 +5011,16 @@ async function openLibrary() {
 async function loadSavedPlan(id) {
   try {
     const data = await api('/api/library/plan/'+id);
-    loadPlan(data.plan);
+    loadPlan(data.plan);                       // resets S.imagePaths to {}
+    // Restore the saved images + thumbnails so the plan is render-ready.
+    S.imagePaths = data.image_paths || {};
+    Object.entries(S.imagePaths).forEach(([i,p]) => {
+      if (p) setThumb(parseInt(i), '/image_cache/' + p.split(/[/\\]/).pop());
+    });
     closeModal();
     showTab('editor', document.querySelectorAll('.nav-btn')[2]);
-    toast('Plan loaded');
+    const n = Object.keys(S.imagePaths).length;
+    toast('Plan loaded' + (n ? ` (caption + ${n} image${n>1?'s':''})` : ''));
   } catch(e){ toast(e.message,'err'); }
 }
 async function delSavedPlan(id, btn) {

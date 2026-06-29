@@ -111,6 +111,41 @@ def extract_clip(youtube_url: str, start: float, end: float, *,
     return target
 
 
+def download_full(youtube_url: str, *, rights_cleared: bool = False,
+                  out_dir: Path = CLIPS_DIR) -> Path:
+    """Download the WHOLE video at the highest available resolution, once.
+
+    Unlike extract_clip (a fast, ≤1080p ranged grab), this pulls bestvideo+
+    bestaudio with no resolution cap so downstream 9:16 crops keep their detail.
+    Cached per video url. Container may be mp4/mkv/webm — ffmpeg reads all three;
+    the per-card composite re-encodes to H.264 anyway.
+    """
+    if not rights_cleared:
+        raise PermissionError(RIGHTS_MSG)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    uid = hashlib.md5(youtube_url.encode()).hexdigest()[:10]
+    existing = sorted(out_dir.glob(f"full_{uid}.*"))
+    existing = [p for p in existing if p.suffix.lower() in (".mp4", ".mkv", ".webm")]
+    if existing:
+        return existing[0]
+
+    import yt_dlp
+    opts = {
+        "format": "bestvideo+bestaudio/best",          # max resolution, merged
+        "merge_output_format": "mp4",
+        "outtmpl": str(out_dir / f"full_{uid}.%(ext)s"),
+        "quiet": True, "no_warnings": True, "noprogress": True,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([youtube_url])
+
+    produced = [p for p in sorted(out_dir.glob(f"full_{uid}.*"))
+                if p.suffix.lower() in (".mp4", ".mkv", ".webm")]
+    if not produced:
+        raise RuntimeError("yt-dlp produced no output (video unavailable or blocked).")
+    return produced[0]
+
+
 # ── 2. compositing (ffmpeg) ───────────────────────────────────────────────────
 
 def _hex(c: str) -> str:
