@@ -1,10 +1,34 @@
-# K2 Press — Multi-Brand Carousel & Reel Generator
+# K2 Press — Instagram & Social Media Content Studio
 
-Turn RSS/news feeds (and YouTube trailers) into branded Instagram posts — automatically
-planned, image-fetched, and rendered to PNGs/9:16 video using HTML/CSS templates and a
-headless browser, then published to Instagram via Postiz. Multi-brand and fully
-config-driven — copy `config.example.yaml` to `config.yaml` and add your own brands.
-Includes a live template editor and a drag-and-drop canvas design tool.
+A self-hosted, local-AI **content studio for Instagram and social media**: create
+branded posts (manually from your own idea, or automatically from RSS/trending news
+and YouTube trailers), edit every pixel, and **publish to Instagram and other
+platforms through [Postiz](https://postiz.com)**. Multi-brand, multi-channel, and
+fully config-driven — copy `config.example.yaml` to `config.yaml` and add your own
+brands. Bring your own logo, colours, feeds, and channels.
+
+## What it does
+
+- **Create posts two ways** — ✍️ **Manual** (your idea + notes + images → AI builds the
+  carousel and suggests angles) or 📡 **Auto** (fetch + AI-score RSS/trending stories).
+- **Many formats** — carousel, square, story, X/Twitter, quote, comparison, breaking,
+  listicle, LinkedIn — plus **9:16 Reels & video carousels** from YouTube trailers.
+- **Full editor** — edit every line, fetch/upload/paste/URL images per slide, live preview,
+  template editor, and a Fabric.js canvas for hand layout.
+- **Publish anywhere Postiz supports** — Instagram (Business/Creator), and any other
+  channel you connect in Postiz (Facebook, LinkedIn, X, TikTok, YouTube, Threads…).
+  A review-and-approve gate sends each post to Postiz as a **draft** by default.
+- **Local & private** — runs on your machine with a local LLM (Hermes or Ollama). Your
+  brands, keys, and channels stay in gitignored config; only the generic template ships.
+
+## Documentation
+
+| Doc | What's in it |
+|---|---|
+| [docs/SETUP.md](docs/SETUP.md) | Install, `.env`, host vs Docker, Hermes/Ollama, auto-start |
+| [docs/PUBLISHING_AND_CHANNELS.md](docs/PUBLISHING_AND_CHANNELS.md) | **Connect Postiz + add multiple Instagram/social channels** (the publishing guide) |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | `config.yaml` reference — brands, themes, feeds, formats, Postiz |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the modules fit together (for contributors) |
 
 ## Tech stack
 

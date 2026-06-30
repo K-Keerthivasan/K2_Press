@@ -74,13 +74,40 @@ def _set_progress(done: int, total: int, current: str = "", brand: str = "",
     if running:
         _busy["since"] = time.time()
 
+USED_FILE = Path("library/used_urls.json")
+
+
+def _used_persisted() -> set[str]:
+    """Story URLs already turned into posts — persisted so a server restart
+    doesn't re-surface (and re-generate) the same content."""
+    try:
+        return set(json.loads(USED_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _used_all() -> set[str]:
+    return set(_session.get("used_urls") or ()) | _used_persisted()
+
+
 def _mark_used(*urls: str | None) -> None:
     """Remember stories we've generated from so a re-fetch won't surface them
-    again this session. Reset on brand switch (or via /api/session/reset)."""
+    again — both this session AND persistently on disk. Clear via the 'Reset
+    seen' button (/api/session/reset)."""
     seen = _session.setdefault("used_urls", set())
+    persisted = _used_persisted()
+    changed = False
     for u in urls:
         if u:
             seen.add(u)
+            if u not in persisted:
+                persisted.add(u); changed = True
+    if changed:
+        try:
+            USED_FILE.parent.mkdir(parents=True, exist_ok=True)
+            USED_FILE.write_text(json.dumps(sorted(persisted)), encoding="utf-8")
+        except Exception as e:
+            print(f"[used] persist failed: {e}")
 
 
 # Single-flight guard: only one heavy LLM job (fetch/plan/batch) at a time so a
@@ -176,6 +203,22 @@ def _sync_generate_plan(story_dict, total_slides, model, tone=""):
     brand  = resolve_brand(config)
     return plan_story(story, config, total_slides=total_slides, model=model,
                       brand=brand, tone=tone)
+
+
+def _sync_suggest_angles(idea, tone=""):
+    """Propose a few alternative carousel angles/headlines for a manual idea."""
+    from llm import chat_json
+    from brands import resolve_brand
+    config = _cfg()
+    brand  = resolve_brand(config)
+    bn = brand.get("name", "the brand")
+    system = (f"You are a social content strategist for {bn}. Given a rough idea, propose "
+              "4 DISTINCT, punchy Instagram carousel angles (each a different take, max 70 "
+              'chars). Return ONLY JSON: {"angles": ["...", "...", "...", "..."]}')
+    user = f"Idea: {idea}\nTone: {tone or 'default brand voice'}"
+    out = chat_json(system, user)
+    angles = out.get("angles") if isinstance(out, dict) else None
+    return [a.strip() for a in (angles or []) if isinstance(a, str) and a.strip()][:4]
 
 
 def _sync_regen_caption(plan, tone):
@@ -1003,10 +1046,15 @@ async def api_cancel():
 # ── API: session ──────────────────────────────────────────────────────────────
 @app.post("/api/session/reset")
 async def api_session_reset(body: dict = Body(default={})):
-    """Forget which stories were already generated this session (the dedup set),
-    so previously-used stories can be served again on the next fetch."""
-    n = len(_session.get("used_urls") or ())
+    """Forget which stories were already generated (the dedup set) — both the
+    session set AND the persisted on-disk list — so previously-used/posted
+    stories can be served again on the next fetch."""
+    n = len(_used_all())
     _session["used_urls"] = set()
+    try:
+        USED_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
     return {"ok": True, "cleared": n}
 
 
@@ -1264,7 +1312,7 @@ async def api_fetch_stories(
     _acquire("fetch stories")
     t0 = time.time()
     try:
-        exclude = set(_session.get("used_urls") or ())
+        exclude = _used_all()   # session + persisted: never re-serve posted content
         ranked = await _run(_sync_fetch_stories, limit, top, category or None,
                             model or None, exclude, bkey)
         _session["stories"] = ranked
@@ -1279,6 +1327,23 @@ async def api_fetch_stories(
 
 
 # ── API: plan ─────────────────────────────────────────────────────────────────
+@app.post("/api/manual/suggest")
+async def api_manual_suggest(body: dict = Body(default={})):
+    """Suggestion chips for the Create tab: alternative angles for a rough idea."""
+    idea = (body.get("idea") or "").strip()
+    if not idea:
+        raise HTTPException(400, "idea required")
+    _apply_brand(body.get("brand"))
+    _acquire("suggest angles")
+    try:
+        angles = await _run(_sync_suggest_angles, idea, body.get("tone", ""))
+        return {"angles": angles}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        _release()
+
+
 @app.post("/api/plan/generate")
 async def api_generate_plan(body: dict = Body(...)):
     story       = body.get("story", {})
@@ -1486,7 +1551,8 @@ async def api_image_from_url(body: dict = Body(...)):
             _session["image_paths"][str(sidx)] = path
         return {"path": path, "filename": Path(path).name}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        # A bad/unreachable/non-image URL is a client problem, not a server fault.
+        raise HTTPException(400, f"Couldn't fetch that image URL ({e})")
 
 
 @app.post("/api/images/upload/{slide_idx}")
@@ -1784,8 +1850,9 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 .tab.active{display:flex;}
 /* ═══ STORIES TAB ══════════════════════════════════════════════════════════ */
 #tab-stories{flex-direction:column;}
-/* Review stacks its toolbar above the post list (default .tab is row). */
+/* Review + Create stack their toolbar above the content (default .tab is row). */
 #tab-review{flex-direction:column;}
+#tab-create{flex-direction:column;}
 .stories-toolbar{display:flex;align-items:center;gap:8px;padding:12px 18px;border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap;}
 /* Keep a label glued to its control so they wrap together, not as loose items. */
 .tb-group{display:inline-flex;align-items:center;gap:5px;flex-shrink:0;margin:0;}
@@ -1864,7 +1931,9 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 .field-group input:focus,.field-group textarea:focus,.field-group select:focus{outline:none;border-color:var(--teal);}
 .slide-sec{background:rgba(0,180,200,.04);border:1px solid var(--border);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:9px;}
 .slide-sec-title{font-size:12px;font-weight:700;color:var(--teal);}
-.img-row{display:flex;align-items:center;gap:6px;}
+.img-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.img-row .url-inp{min-width:120px;}
+.img-row .btn{flex-shrink:0;}
 .img-thumb{width:48px;height:48px;object-fit:cover;border-radius:5px;border:1px solid var(--border);background:var(--panel);flex-shrink:0;}
 .img-thumb.empty{display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:18px;}
 .src-sel{background:#0d1828;border:1px solid var(--border);border-radius:6px;color:#fff;padding:5px 6px;font-size:12px;font-family:inherit;}
@@ -2295,12 +2364,13 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
   <div class="sidebar-logo">
     <div class="logo">
       <img class="js-brand-logo" src="/static/logo.png" alt="brand">
-      <span class="logo-text js-brand-name">K2<span> Digital Media</span></span>
+      <span class="logo-text js-brand-name">Your<span> Brand</span></span>
     </div>
   </div>
   <nav>
     <div class="nav-section">Posts</div>
-    <button class="nav-btn active" onclick="showTab('stories',this)">📰 Stories</button>
+    <button class="nav-btn active" onclick="showTab('create',this)">✍️ Create</button>
+    <button class="nav-btn"       onclick="showTab('stories',this)">📡 Auto (RSS)</button>
     <button class="nav-btn"       onclick="showTab('bulk',this)">⚡ Bulk</button>
     <button class="nav-btn"       onclick="showTab('agent',this)">🤖 Agent</button>
     <button class="nav-btn"       onclick="showTab('review',this)">✅ Review<span id="review-badge" class="nav-badge" style="display:none;">0</span></button>
@@ -2338,7 +2408,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
   <button class="hamburger" id="hamburger" onclick="toggleNav()" aria-label="Menu" aria-expanded="false">☰</button>
   <div class="logo">
     <img class="js-brand-logo" src="/static/logo.png" alt="brand">
-    <span class="logo-text js-brand-name">K2<span> Digital Media</span></span>
+    <span class="logo-text js-brand-name">Your<span> Brand</span></span>
   </div>
 </header>
 
@@ -2360,8 +2430,63 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 
 <div class="main">
 
-<!-- ═══════════ STORIES ══════════════════════════════════════════════════ -->
-<div id="tab-stories" class="tab active">
+<!-- ═══════════ CREATE (MANUAL) ═══════════════════════════════════════════ -->
+<div id="tab-create" class="tab active">
+  <div class="stories-toolbar" style="flex-wrap:wrap;">
+    <b style="font-size:14px;color:#fff;">✍️ Create a post</b>
+    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Give an idea, optional points, slide count and images — the AI writes the carousel, you refine it in the Editor.</span>
+  </div>
+  <div style="flex:1;overflow-y:auto;padding:22px;display:flex;justify-content:center;">
+    <div style="width:100%;max-width:640px;display:flex;flex-direction:column;gap:16px;">
+
+      <div class="field-group">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <label style="margin:0;">Idea / topic <span style="color:var(--red);">*</span></label>
+          <button class="btn btn-ghost btn-sm" id="m-suggest-btn" style="padding:2px 9px;font-size:11px;" onclick="manualSuggest()" title="Get a few alternative angles to choose from">💡 Suggest angles</button>
+        </div>
+        <input id="m-idea" class="url-inp" style="width:100%;font-size:14px;padding:11px 13px;"
+               placeholder="e.g. 5 signs your website is quietly losing leads"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();manualGenerate();}">
+        <div id="m-angles" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;"></div>
+      </div>
+
+      <div class="field-group">
+        <label>Key points / notes <span style="color:var(--muted);font-weight:400;">(optional — the AI structures these into slides)</span></label>
+        <textarea id="m-notes" rows="5" class="url-inp" style="width:100%;font-size:14px;padding:11px 13px;resize:vertical;"
+                  placeholder="One thought per line — rough is fine:&#10;— slow load times&#10;— no clear call-to-action&#10;— bad on mobile"></textarea>
+      </div>
+
+      <div style="display:flex;gap:16px;flex-wrap:wrap;">
+        <div class="field-group" style="flex:1;min-width:140px;">
+          <label>Slides</label>
+          <select id="m-slides" class="src-sel" style="width:100%;">
+            <option>3</option><option selected>4</option><option>5</option>
+            <option>6</option><option>7</option><option>8</option><option>9</option><option>10</option>
+          </select>
+        </div>
+        <div class="field-group" style="flex:2;min-width:200px;">
+          <label>Tone / stance <span style="color:var(--muted);font-weight:400;">(optional)</span></label>
+          <input id="m-tone" class="url-inp" list="tone-presets" style="width:100%;" placeholder="e.g. helpful, bold, skeptical…">
+        </div>
+      </div>
+
+      <div class="field-group">
+        <label>Images <span style="color:var(--muted);font-weight:400;">(optional — assigned to your slides in order; you can also paste with Ctrl+V here)</span></label>
+        <div id="m-img-pool" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:4px;"></div>
+        <div style="margin-top:8px;">
+          <button class="btn btn-ghost btn-sm" onclick="document.getElementById('m-img-input').click()">⬆ Add images</button>
+          <input type="file" id="m-img-input" accept="image/png,image/jpeg,image/webp" multiple style="display:none" onchange="manualAddImages(this)">
+        </div>
+      </div>
+
+      <button class="btn btn-green" id="m-gen" onclick="manualGenerate()" style="align-self:flex-start;font-size:14px;padding:11px 22px;">✨ Generate post</button>
+      <div style="font-size:11px;color:var(--muted);">It opens in the Editor with a caption, hashtags and per-slide image suggestions — tweak anything, then Render &amp; Send to Review.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ STORIES (AUTO / RSS) ══════════════════════════════════════ -->
+<div id="tab-stories" class="tab">
   <div class="stories-toolbar">
     <button class="btn btn-primary" onclick="fetchStories()" id="btn-fetch">Fetch &amp; Score</button>
     <button class="btn btn-ghost btn-sm" onclick="resetUsed()" id="btn-reset-used" title="Allow already-generated stories to be served again">↺ Reset seen</button>
@@ -2475,6 +2600,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
       <option value="rejected">Rejected</option>
     </select></label>
     <button class="btn btn-ghost btn-sm" onclick="loadReview()">↻ Refresh</button>
+    <button class="btn btn-ghost btn-sm" onclick="showChannelHelp()" title="How to connect Instagram &amp; add more channels">📖 Add channels</button>
     <button class="btn btn-danger btn-sm" onclick="clearReview()" title="Remove rejected entries">🗑 Clear rejected</button>
   </div>
   <div id="review-list" class="stories-list"></div>
@@ -2829,6 +2955,7 @@ let S = {
   stories: [],
   plan: null,
   imagePaths: {},
+  manualImages: [],       // Create tab: uploaded/pasted images, assigned to slides in order
   slideIdx: 0,
   totalSlides: 0,
   selectedCat: '',
@@ -3157,6 +3284,7 @@ function showTab(name, btn) {
   if (name === 'scripts') refreshScriptStorySelect();
   if (name === 'video') refreshVideoScriptSelect();
   if (name === 'review') loadReview();
+  if (name === 'create') renderManualImages();
   try { localStorage.setItem('k2_active_tab', name); } catch(e) {}   // remember across refresh
   toggleNav(false);   // collapse the mobile drawer after picking a tab
   requestAnimationFrame(refreshResponsiveSurfaces);
@@ -3166,7 +3294,7 @@ function showTab(name, btn) {
 function restoreActiveTab() {
   let name = '';
   try { name = localStorage.getItem('k2_active_tab') || ''; } catch(e) {}
-  if (!name || name === 'stories') return;          // stories is the default
+  if (!name || name === 'create') return;            // Create is the default landing
   const btn = document.querySelector(`.nav-btn[onclick*="showTab('${name}'"]`);
   if (btn) showTab(name, btn);
 }
@@ -3454,6 +3582,32 @@ function reviewCard(it) {
       <div class="rv-actions">${actions}${note}</div>
     </div></div>`;
 }
+// In-app quick tutorial for connecting Instagram and adding more channels.
+function showChannelHelp() {
+  openModal('Connect Instagram & add channels');
+  g('modal-body').innerHTML = `
+    <div style="font-size:13px;line-height:1.65;">
+      <p style="margin-top:0;">This app publishes through <b>Postiz</b>. K2 needs just one secret —
+      your Postiz <b>Public API key</b> in <code>.env</code> (<code>POSTIZ_API_KEY</code>).
+      Every channel is connected <i>inside Postiz</i>, then mapped to a brand here.</p>
+      <ol style="padding-left:18px;display:flex;flex-direction:column;gap:9px;margin:0;">
+        <li><b>Connect a channel in Postiz</b> → <i>Add Channel</i> → Instagram (or Facebook /
+          LinkedIn / X / TikTok / YouTube…). Instagram must be Business/Creator, and OAuth
+          needs a public <b>HTTPS</b> URL (not <code>localhost</code>).</li>
+        <li><b>Get its id:</b> run <code>python postiz.py --list-channels</code> — each channel
+          prints an id, a name, and its platform.</li>
+        <li><b>Map it to a brand</b> in <code>config.yaml</code> under <code>postiz.channels</code>:
+          <code style="display:block;background:#0d1828;padding:8px 10px;border-radius:6px;margin-top:5px;white-space:pre;">channels:
+  brand_a: "cmqy696...id"
+  brand_b: "cmqy69v...id"</code></li>
+        <li><b>Restart K2.</b> Approving a post now routes it to the channel mapped to that
+          post's brand (the Brand selector up top). Repeat for as many channels/brands as you like.</li>
+      </ol>
+      <p style="color:var(--muted);font-size:12px;margin-bottom:0;">Full guide:
+        <code>docs/PUBLISHING_AND_CHANNELS.md</code></p>
+    </div>`;
+}
+
 async function approveReview(id, btn) {
   btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
   try {
@@ -4063,6 +4217,7 @@ function renderForm(plan) {
           <button class="btn btn-ghost btn-sm" onclick="searchImagesFor(${i})" title="Search and pick from a grid">🔍 Search</button>
           <button class="btn btn-ghost btn-sm" onclick="swapImage(${i})" title="Auto-use the top result">Swap</button>
           <button class="btn btn-ghost btn-sm" onclick="document.getElementById('f-up-${i}').click()" title="Upload an image from your computer">⬆ Upload</button>
+          <button class="btn btn-ghost btn-sm" onclick="pasteImage(${i})" title="Paste an image copied to your clipboard">📋 Paste</button>
           <button class="btn btn-ghost btn-sm" onclick="removeImage(${i})" title="Remove image (blank background)">✕</button>
           <input type="file" id="f-up-${i}" accept="image/png,image/jpeg,image/webp" style="display:none" onchange="uploadImage(${i}, this)">
         </div>
@@ -4109,8 +4264,23 @@ function renderForm(plan) {
 
     <div class="slide-sec">
       <div class="slide-sec-title">Caption & Hashtags</div>
-      <div class="field-group"><label>Caption</label><textarea id="f-cap" rows="3" oninput="syncPlan()">${esc(plan.caption||'')}</textarea></div>
-      <div class="field-group"><label>Hashtags (comma-separated)</label><input id="f-tags" value="${esc((plan.hashtags||[]).join(', '))}" oninput="syncPlan()"></div>
+      <div class="field-group">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <label style="margin:0;">Caption</label>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:11px;" onclick="copyField('f-cap','Caption')" title="Copy caption">📋 Copy</button>
+            <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:11px;" onclick="copyCaptionAndTags()" title="Copy caption + hashtags together">📋 Caption + tags</button>
+          </div>
+        </div>
+        <textarea id="f-cap" rows="3" oninput="syncPlan()">${esc(plan.caption||'')}</textarea>
+      </div>
+      <div class="field-group">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <label style="margin:0;">Hashtags (comma-separated)</label>
+          <button class="btn btn-ghost btn-sm" style="padding:2px 8px;font-size:11px;" onclick="copyField('f-tags','Hashtags','#')" title="Copy hashtags">📋 Copy</button>
+        </div>
+        <input id="f-tags" value="${esc((plan.hashtags||[]).join(', '))}" oninput="syncPlan()">
+      </div>
       <div class="field-group"><label>DM Keyword</label><input id="f-dm" value="${esc(plan.dm_keyword||'')}" oninput="syncPlan()"></div>
       <div class="field-group"><label>Tone / stance (optional)</label>
         <input id="f-tone" list="tone-presets" value="${esc(plan.tone||'')}" placeholder="e.g. positive, negative, hyped, skeptical…" oninput="syncPlan()">
@@ -4210,7 +4380,11 @@ async function previewCurrent() {
   try {
     const blob = await fetch(`/api/preview/${S.slideIdx}?brand=${encodeURIComponent(curBrand())}`).then(r=>{if(!r.ok)throw new Error('render failed');return r.blob();});
     const url  = URL.createObjectURL(blob);
-    wrap.innerHTML = `<img src="${url}" alt="slide ${S.slideIdx}">`;
+    wrap.innerHTML = `<div style="position:relative;display:inline-block;max-width:100%;max-height:100%;">
+      <img src="${url}" alt="slide ${S.slideIdx}">
+      <button class="btn btn-ghost btn-sm" onclick="copyImageUrl('${url}','Slide')" title="Copy this slide image to clipboard"
+              style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.65);">📋 Copy</button>
+    </div>`;
   } catch(e) {
     wrap.innerHTML=`<div class="preview-placeholder" style="color:var(--red);">${e.message}</div>`;
     toast(e.message,'err');
@@ -4275,19 +4449,185 @@ async function removeImage(idx) {
   } catch(e){ toast(e.message,'err'); }
 }
 
+// Shared: POST an image blob to a slide and reflect it in the thumb + preview.
+async function _setSlideImageFromBlob(idx, blob, filename) {
+  const fd = new FormData();
+  fd.append('file', blob, filename);
+  const r = await fetch(`/api/images/upload/${idx}`, {method:'POST', body:fd})
+    .then(r => { if(!r.ok) return r.json().then(j=>{throw new Error(j.detail||'upload failed')}); return r.json(); });
+  S.imagePaths[idx] = r.path;
+  setThumb(idx, '/image_cache/' + r.filename);
+  showSlidePreview(idx+1);
+  return r;
+}
+
 async function uploadImage(idx, input) {
   const f = input.files && input.files[0];
   if (!f) return;
-  const fd = new FormData(); fd.append('file', f);
-  try {
-    const r = await fetch(`/api/images/upload/${idx}`, {method:'POST', body:fd})
-      .then(r => { if(!r.ok) return r.json().then(j=>{throw new Error(j.detail||'upload failed')}); return r.json(); });
-    S.imagePaths[idx] = r.path;
-    setThumb(idx, '/image_cache/' + r.filename);
-    toast(`Slide ${idx+1} image uploaded`);
-    showSlidePreview(idx+1);
-  } catch(e){ toast(e.message,'err'); }
+  try { await _setSlideImageFromBlob(idx, f, f.name); toast(`Slide ${idx+1} image uploaded`); }
+  catch(e){ toast(e.message,'err'); }
   finally { input.value = ''; }   // allow re-uploading the same file
+}
+
+// Paste an image from the clipboard into a slide (per-slide 📋 Paste button).
+async function pasteImage(idx) {
+  if (!navigator.clipboard || !navigator.clipboard.read) {
+    toast('Clipboard paste needs a Chromium browser on localhost — use ⬆ Upload or Ctrl+V', 'err');
+    return;
+  }
+  try {
+    const items = await navigator.clipboard.read();
+    for (const it of items) {
+      const type = it.types.find(t => t.startsWith('image/'));
+      if (type) {
+        const blob = await it.getType(type);
+        const ext  = (type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+        await _setSlideImageFromBlob(idx, blob, `paste-${idx}.${ext}`);
+        toast(`Slide ${idx+1} image pasted`);
+        return;
+      }
+    }
+    toast('No image found in clipboard', 'err');
+  } catch(e){ toast('Clipboard blocked: ' + e.message, 'err'); }
+}
+
+// Ctrl+V anywhere in the Editor pastes the clipboard image onto the slide
+// currently shown in the preview (use ‹ › to pick the slide first).
+document.addEventListener('paste', (e) => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  const createActive = document.getElementById('tab-create')?.classList.contains('active');
+  const editorActive = document.getElementById('tab-editor')?.classList.contains('active');
+  if (!createActive && !editorActive) return;
+  for (const it of items) {
+    if (it.type && it.type.startsWith('image/')) {
+      const blob = it.getAsFile();
+      if (createActive) {                         // add to the Create image pool
+        e.preventDefault();
+        S.manualImages = S.manualImages || [];
+        S.manualImages.push(blob); renderManualImages();
+        toast('Image added'); return;
+      }
+      const n  = (S.plan && S.plan.content_slides ? S.plan.content_slides.length : 0);
+      const ci = S.slideIdx - 1;                  // content-slide index of the previewed slide
+      if (ci < 0 || ci >= n) { toast('Pick a content slide (use ‹ ›), then paste', 'err'); return; }
+      e.preventDefault();
+      const ext = (it.type.split('/')[1] || 'png').replace('jpeg', 'jpg');
+      _setSlideImageFromBlob(ci, blob, `paste-${ci}.${ext}`)
+        .then(() => toast(`Slide ${ci+1} image pasted`))
+        .catch(err => toast(err.message, 'err'));
+      return;
+    }
+  }
+});
+
+// ═══ Create (Manual) ═══════════════════════════════════════════════════════
+function manualAddImages(input){
+  S.manualImages = S.manualImages || [];
+  for (const f of input.files) if (f.type.startsWith('image/')) S.manualImages.push(f);
+  input.value=''; renderManualImages();
+}
+function manualRemoveImage(i){ (S.manualImages||[]).splice(i,1); renderManualImages(); }
+function renderManualImages(){
+  const pool = g('m-img-pool'); if(!pool) return;
+  S.manualImages = S.manualImages || [];
+  if(!S.manualImages.length){
+    pool.innerHTML = '<span style="font-size:11px;color:var(--muted);">No images yet — the AI will suggest stock images per slide. Add or paste your own to override.</span>';
+    return;
+  }
+  pool.innerHTML = S.manualImages.map((f,i)=>`
+    <div style="position:relative;">
+      <img src="${URL.createObjectURL(f)}" style="width:58px;height:58px;object-fit:cover;border-radius:6px;border:1px solid var(--border);display:block;">
+      <button onclick="manualRemoveImage(${i})" title="Remove" style="position:absolute;top:-7px;right:-7px;background:var(--red);color:#fff;border:none;border-radius:50%;width:18px;height:18px;font-size:12px;cursor:pointer;line-height:1;">×</button>
+      <span style="position:absolute;bottom:0;left:0;right:0;text-align:center;font-size:9px;color:#fff;background:rgba(0,0,0,.5);">slide ${i+1}</span>
+    </div>`).join('');
+}
+
+async function manualSuggest(){
+  const idea = (g('m-idea')?.value||'').trim();
+  if(!idea){ toast('Type a rough idea first','err'); g('m-idea')?.focus(); return; }
+  const btn = g('m-suggest-btn'); const lbl = btn.innerHTML; btn.disabled=true; btn.innerHTML='<span class="spin"></span> Thinking…';
+  try {
+    const data = await api('/api/manual/suggest','POST',{idea, tone:g('m-tone')?.value||'', brand:curBrand()});
+    const angles = data.angles || [];
+    const box = g('m-angles');
+    box.innerHTML = angles.length
+      ? '<span style="font-size:11px;color:var(--muted);width:100%;">Tap one to use it:</span>' + angles.map(a=>
+          `<button class="btn btn-ghost btn-sm" style="font-size:11px;" onclick="g('m-idea').value=${JSON.stringify(a)};">${esc(a)}</button>`).join('')
+      : '<span style="font-size:11px;color:var(--muted);">No suggestions — try a more specific idea.</span>';
+  } catch(e){ toast(e.message,'err'); }
+  finally { btn.disabled=false; btn.innerHTML=lbl; }
+}
+
+async function manualGenerate(){
+  const idea = (g('m-idea')?.value||'').trim();
+  if(!idea){ toast('Enter an idea or topic','err'); g('m-idea')?.focus(); return; }
+  const notes  = (g('m-notes')?.value||'').trim();
+  const slides = parseInt(g('m-slides')?.value||'4');
+  const tone   = (g('m-tone')?.value||'').trim();
+  const btn = g('m-gen'); const lbl = btn.innerHTML; btn.disabled=true; btn.innerHTML='<span class="spin"></span> Generating…';
+  const t0=Date.now(); const tid=setInterval(()=>{ const h=g('hdr-timer'); if(h) h.textContent=((Date.now()-t0)/1000).toFixed(1)+'s'; },200);
+  try {
+    const data = await api('/api/plan/generate','POST',{
+      story:{title:idea, summary: notes||idea, url:'', published:'', image:''},
+      total_slides: slides, model: g('model-sel')?.value||'', tone, brand: curBrand(),
+    });
+    clearInterval(tid); const h=g('hdr-timer'); if(h) h.textContent=data.elapsed+'s';
+    loadPlan(data.plan);
+    // assign pooled images to the content slides, in order
+    const imgs = S.manualImages || [];
+    for(let i=0;i<imgs.length;i++){
+      try { await _setSlideImageFromBlob(i, imgs[i], imgs[i].name||`manual-${i}.png`); } catch(err){}
+    }
+    S.manualImages = []; renderManualImages();
+    showTab('editor');
+    toast(`Post generated (${data.elapsed}s) — refine, then Render`);
+    notify('Post generated', (data.plan.title_card&&data.plan.title_card.headline)||idea.slice(0,60));
+  } catch(e){ clearInterval(tid); toast(e.message,'err'); }
+  finally { btn.disabled=false; btn.innerHTML=lbl; }
+}
+
+// Copy a field's text to the clipboard. mode '#' formats CSV tags as "#a #b".
+async function copyField(id, label, mode) {
+  const el = g(id); if (!el) return;
+  let text = el.value || '';
+  if (mode === '#') {
+    text = text.split(',').map(t=>t.trim()).filter(Boolean)
+               .map(t=> t.startsWith('#') ? t : '#'+t).join(' ');
+  }
+  await _copyText(text, label);
+}
+
+function copyCaptionAndTags() {
+  const cap  = g('f-cap')?.value || '';
+  const tags = (g('f-tags')?.value || '').split(',').map(t=>t.trim()).filter(Boolean)
+                 .map(t=> t.startsWith('#') ? t : '#'+t).join(' ');
+  _copyText(cap + (tags ? '\n\n' + tags : ''), 'Caption + hashtags');
+}
+
+// Copy a rendered slide/screenshot (PNG) to the clipboard as an image.
+async function copyImageUrl(url, label) {
+  try {
+    const blob = await fetch(url).then(r => { if(!r.ok) throw new Error('could not load image'); return r.blob(); });
+    if (!navigator.clipboard || !window.ClipboardItem) throw new Error('image copy needs a Chromium browser');
+    await navigator.clipboard.write([ new ClipboardItem({ 'image/png': blob }) ]);
+    toast((label || 'Image') + ' copied');
+  } catch(e) { toast('Copy image failed: ' + e.message, 'err'); }
+}
+
+async function _copyText(text, label) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast((label||'Text') + ' copied');
+  } catch(e) {
+    // fallback for browsers/contexts that block the async clipboard API
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); toast((label||'Text') + ' copied'); }
+    catch(_) { toast('Copy failed', 'err'); }
+    document.body.removeChild(ta);
+  }
 }
 
 async function imgFromUrl(idx) {
@@ -4399,8 +4739,11 @@ async function renderFull() {
       <div style="text-align:center;padding:16px;line-height:1.8;">
         <div style="font-size:16px;font-weight:700;color:var(--green);margin-bottom:6px;">Carousel saved!</div>
         <div style="font-size:12px;color:var(--muted);">${data.output_dir}</div>
-        <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:6px;justify-content:center;">
-          ${data.files.map(f=>`<a href="/outputs/${data.rel}/${f}" target="_blank" style="color:var(--teal);font-size:11px;">${f}</a>`).join('')}
+        <div style="margin-top:12px;display:flex;flex-direction:column;gap:5px;align-items:center;">
+          ${data.files.map(f=>`<div style="display:flex;align-items:center;gap:8px;">
+            <a href="/outputs/${data.rel}/${f}" target="_blank" style="color:var(--teal);font-size:11px;">${f}</a>
+            <button class="btn btn-ghost btn-sm" style="font-size:10px;padding:1px 7px;" onclick="copyImageUrl('/outputs/${data.rel}/${f}','${f}')" title="Copy this slide image">📋</button>
+          </div>`).join('')}
         </div>
         <div style="margin-top:14px;">
           <button class="btn btn-green btn-sm" onclick="sendEditorToReview(this)">✓ Send to Review</button>

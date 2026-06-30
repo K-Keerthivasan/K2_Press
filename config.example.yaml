@@ -6,7 +6,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 app:
-  name: "My Studio"          # shown as the browser tab title
+  name: "Post Studio"        # shown as the browser tab title
 
 # Which brand the app is currently posting for. Switch in the header dropdown.
 active_brand: demo
