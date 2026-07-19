@@ -171,6 +171,11 @@ def generate_carousel(plan: dict, image_paths: dict | None = None,
     out_dir   = root / f"{date.today().isoformat()}_{slug}_{fmt_label}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # A slug can be rendered more than once on the same day. Remove the prior
+    # slide set first; otherwise shortening a carousel leaves stale PNGs behind.
+    for old_slide in out_dir.glob("*.png"):
+        old_slide.unlink()
+
     content_slides = plan.get("content_slides", [])
     total_slides   = 1 + len(content_slides) + 1
 

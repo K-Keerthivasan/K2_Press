@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -180,6 +181,21 @@ def _hermes_model_arg(model: str) -> str | None:
     return model.removeprefix("hermes:")
 
 
+def _is_transient_hermes_log_lock(detail: str) -> bool:
+    """Detect Hermes' intermittent Windows rotating-log lock failure."""
+    normalized = detail.casefold().replace("\\\\", "\\")
+    permission_error = (
+        "permission denied" in normalized
+        or "winerror 32" in normalized
+        or "used by another process" in normalized
+    )
+    hermes_log = any(
+        name in normalized
+        for name in ("agent.log", "errors.log", "gateway.log")
+    )
+    return permission_error and hermes_log
+
+
 class _HermesCompletions:
     def create(self, **kwargs):
         if kwargs.get("tools"):
@@ -188,24 +204,41 @@ class _HermesCompletions:
         messages = kwargs.get("messages") or []
         response_format = kwargs.get("response_format") or {}
         prompt = _messages_to_prompt(messages, json_only=response_format.get("type") == "json_object")
-        cmd = [os.getenv("K2_HERMES_COMMAND") or "hermes", "-z", prompt]
+        # Keep K2's one-shot sessions and rotating logs separate from the
+        # long-running Hermes gateway. Both processes opening the default
+        # profile's agent.log can cause persistent WinError/Errno 13 failures.
+        cmd = [os.getenv("K2_HERMES_COMMAND") or "hermes"]
+        profile = os.getenv("K2_HERMES_PROFILE", "k2-posttool").strip()
+        if profile:
+            cmd.extend(["-p", profile])
+        cmd.extend(["-z", prompt])
         if model:
             cmd[1:1] = ["-m", model]
         timeout = int(os.getenv("K2_HERMES_TIMEOUT", "300"))
-        try:
-            out = subprocess.run(
-                cmd,
-                cwd=os.getcwd(),
-                text=True,
-                encoding="utf-8",      # Hermes emits UTF-8; without this Windows
-                errors="replace",      # decodes as cp1252 → mojibake (’ → â€™).
-                capture_output=True,
-                timeout=timeout,
-                check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            detail = (e.stderr or e.stdout or str(e)).strip()
-            raise RuntimeError(f"Hermes CLI failed: {detail}") from e
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                out = subprocess.run(
+                    cmd,
+                    cwd=os.getcwd(),
+                    text=True,
+                    encoding="utf-8",      # Hermes emits UTF-8; without this Windows
+                    errors="replace",      # decodes as cp1252 → mojibake (’ → â€™).
+                    capture_output=True,
+                    timeout=timeout,
+                    check=True,
+                )
+                break
+            except subprocess.CalledProcessError as e:
+                detail = (e.stderr or e.stdout or str(e)).strip()
+                if not _is_transient_hermes_log_lock(detail) or attempt == max_attempts:
+                    raise RuntimeError(f"Hermes CLI failed: {detail}") from e
+                delay = 0.5 * attempt
+                print(
+                    f"[llm] Hermes log file was temporarily locked; "
+                    f"retrying in {delay:.1f}s ({attempt}/{max_attempts - 1})."
+                )
+                time.sleep(delay)
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=out.stdout.strip()))]
         )
@@ -261,7 +294,7 @@ def chat_json(system: str, user: str, model: str | None = None,
             model=mdl,
             messages=messages,
             response_format={"type": "json_object"},
-            temperature=0.3 if attempt == 0 else 0.1,
+            temperature=0.1,  # Deterministic: low temp for consistent output
         )
         try:
             return _clean_json(resp.choices[0].message.content)

@@ -19,7 +19,19 @@ CACHE      = Path("video_cache")
 CLIPS_DIR  = CACHE / "clips"
 OUT_DIR    = CACHE / "out"
 TMP_DIR    = CACHE / "tmp"
-W, H       = 1080, 1920
+W, H       = 1080, 1920          # default 9:16 (reel/story)
+
+# Supported output aspect ratios → (width, height). 1080-wide IG ratios + landscape.
+ASPECTS = {
+    "9:16": (1080, 1920),   # reel / story
+    "4:5":  (1080, 1350),   # IG portrait feed
+    "1:1":  (1080, 1080),   # square
+    "16:9": (1920, 1080),   # landscape
+}
+
+
+def dims_for_aspect(aspect: str) -> tuple[int, int]:
+    return ASPECTS.get(aspect or "9:16", (W, H))
 
 RIGHTS_MSG = (
     "YouTube extraction requires explicit rights confirmation. Pass "

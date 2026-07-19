@@ -128,13 +128,13 @@ def _run_json_agent(client, model: str, messages: list[dict], tools: list[dict],
                 model=model,
                 messages=json_messages,
                 response_format={"type": "json_object"},
-                temperature=0.1,
+                temperature=0.1,  # Deterministic: low temp for consistent output
             )
         except Exception:
             resp = client.chat.completions.create(
                 model=model,
                 messages=json_messages,
-                temperature=0.1,
+                temperature=0.1,  # Deterministic: low temp for consistent output
             )
         content = resp.choices[0].message.content or ""
         json_messages.append({"role": "assistant", "content": content})
@@ -189,7 +189,7 @@ def run_agent(client, model: str, messages: list[dict], tools: list[dict],
     for _ in range(max_steps):
         try:
             resp = client.chat.completions.create(
-                model=model, messages=messages, tools=tools, temperature=0.2)
+                model=model, messages=messages, tools=tools, temperature=0.1)  # Deterministic
         except Exception:
             return _run_json_agent(client, model, messages, tools, dispatch, max_steps)
         msg = resp.choices[0].message

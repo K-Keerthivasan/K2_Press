@@ -76,9 +76,27 @@ def _normalize_variant(raw: dict, idx: int, platform: str, content_type: str,
                     t = 0.0
                 captions.append({"time": t, "text": str(c["text"]).strip()})
 
+    # Ordered, editable segments (label/time/text).
+    segments = []
+    raw_segs = raw.get("segments")
+    if isinstance(raw_segs, list):
+        for s in raw_segs:
+            if isinstance(s, dict) and s.get("text"):
+                try:
+                    t = round(float(s.get("time", 0)), 2)
+                except (TypeError, ValueError):
+                    t = 0.0
+                segments.append({"label": str(s.get("label") or "Beat").strip(),
+                                 "time": t, "text": str(s["text"]).strip()})
+    segments.sort(key=lambda s: s["time"])
+
+    voice_over = str(raw.get("voice_over") or raw.get("script") or "").strip()
+    if not voice_over and segments:
+        voice_over = " ".join(s["text"] for s in segments)
+
     beats = _num_list(raw.get("beat_timestamps"))
-    if not beats and captions:
-        beats = [c["time"] for c in captions]
+    if not beats:
+        beats = [s["time"] for s in segments] or [c["time"] for c in captions]
 
     return {
         "id":             f"script_{idx:03d}",
@@ -86,7 +104,8 @@ def _normalize_variant(raw: dict, idx: int, platform: str, content_type: str,
         "platform":       platform,
         "content_type":   content_type,
         "hook":           str(raw.get("hook") or "").strip(),
-        "voice_over":     str(raw.get("voice_over") or raw.get("script") or "").strip(),
+        "segments":       segments,
+        "voice_over":     voice_over,
         "duration_seconds": int(raw.get("duration_seconds") or duration),
         "beat_timestamps": beats,
         "captions":       captions,
@@ -107,6 +126,9 @@ def generate_scripts(
     num_variants: int = 3,
     duration: int = DEFAULT_DURATION,
     model: str | None = None,
+    outline: list[str] | None = None,   # user's own beats/segments (one per point)
+    hook: str = "",                     # user's own opening line (optional)
+    cta: str = "",                      # user's own closing CTA (optional)
 ) -> list[dict]:
     """Generate ``num_variants`` script variants for a story or free topic."""
     if config is None:
@@ -144,7 +166,8 @@ Return ONE valid JSON object (no markdown, no code fences) with EXACTLY this sha
     {{
       "angle":            "<short name for this script's angle, max 40 chars>",
       "hook":             "<the spoken opening line, must grab attention in the first 2s>",
-      "voice_over":       "<the full voiceover script, natural spoken language, {duration}s when read aloud>",
+      "segments":         [{{"label": "<Hook | Beat 1 | Beat 2 | … | CTA>", "time": <seconds this segment starts, ascending from 0>, "text": "<the spoken line(s) for this segment>"}}],
+      "voice_over":       "<the full voiceover = all segment texts read in order>",
       "duration_seconds": {duration},
       "beat_timestamps":  [<seconds for each beat/scene change, starting at 0, ascending, last ≈ {duration}>],
       "captions":         [{{"time": <seconds>, "text": "<on-screen caption phrase, 2-6 words>"}}],
@@ -156,21 +179,35 @@ Return ONE valid JSON object (no markdown, no code fences) with EXACTLY this sha
 
 RULES:
 - Produce EXACTLY {num_variants} distinct script variants — each a genuinely different angle.
+- Break each script into ordered "segments" (Hook first, CTA last); segment times ascend from 0 to ~{duration}. voice_over is those segment texts joined.
 - voice_over must be spoken-word (what a narrator says), not bullet points.
 - captions must cover the whole script, synced to beat_timestamps; each caption is short enough to read on a phone.
 - beat_timestamps and caption times are ascending and within 0..{duration}.
 - Stay factual and true to the source; do not invent specific numbers or quotes.
 - Handle for the brand is {handle}."""
 
+    # The user may supply their own structure: an outline (their beats/segments),
+    # a hook line, and/or a CTA. When given, the script must follow it.
+    struct = ""
+    if outline:
+        pts = "\n".join(f"  {i+1}. {p}" for i, p in enumerate(outline) if p)
+        if pts:
+            struct += ("\nMY OUTLINE — follow these as the ordered segments (one segment per point, "
+                       f"plus a Hook first and a CTA last):\n{pts}\n")
+    if hook:
+        struct += f"\nUSE THIS HOOK (opening line): {hook}\n"
+    if cta:
+        struct += f"\nUSE THIS CTA (closing line): {cta}\n"
+
     if story is not None:
         user = (
             f"Source story:\nTitle: {story.title}\nSummary: {story.summary[:900]}\nURL: {story.url}\n"
-            f"{('Keywords: ' + kw_line) if kw_line else ''}"
+            f"{('Keywords: ' + kw_line) if kw_line else ''}{struct}"
         )
     else:
         user = (
             f"Topic: {topic or 'an on-brand topic for this audience'}\n"
-            f"{('Keywords: ' + kw_line) if kw_line else ''}"
+            f"{('Keywords: ' + kw_line) if kw_line else ''}{struct}"
         )
 
     result = chat_json(system, user, model=model)

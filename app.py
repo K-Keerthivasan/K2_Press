@@ -57,6 +57,7 @@ _session: dict[str, Any] = {
     "stories":      [],
     "plan":         None,
     "image_paths":  {},   # {str(slide_idx): str path}
+    "batch":        [],   # last "Generate All Selected" results (per brand)
     "rendered_dir": None,
     "used_urls":    set(),  # stories already generated this session — not re-served
     "bulk_progress": None,  # {done,total,current,brand,running} during a bulk run
@@ -108,6 +109,75 @@ def _mark_used(*urls: str | None) -> None:
             USED_FILE.write_text(json.dumps(sorted(persisted)), encoding="utf-8")
         except Exception as e:
             print(f"[used] persist failed: {e}")
+
+
+# ── Autosave: persist the working plan + images PER BRAND so a page refresh, a
+# server restart, OR a brand switch never loses in-progress editing. Each brand
+# keeps its own autosave file (library/_autosave_<brand>.json).
+def _autosave_path(brand_key: str | None = None) -> Path:
+    if brand_key is None:
+        from brands import active_key
+        try:
+            brand_key = active_key(_cfg()) or "default"
+        except Exception:
+            brand_key = "default"
+    return Path(f"library/_autosave_{brand_key}.json")
+
+
+def _autosave_write(brand_key: str | None = None) -> None:
+    try:
+        p = _autosave_path(brand_key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "plan":        _session.get("plan"),
+            "image_paths": _session.get("image_paths", {}),
+            "stories":     _session.get("stories", []),
+            "batch":       _session.get("batch", []),
+        }, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[autosave] write failed: {e}")
+
+
+def _autosave_restore(force: bool = False, brand_key: str | None = None) -> None:
+    """Load a brand's autosaved plan + images + fetched stories into the session.
+    With force=True (brand switch) it replaces the current state even if one is
+    loaded, clearing to empty when that brand has no saved work."""
+    if not force and (_session.get("plan") or _session.get("stories")):
+        return
+    try:
+        data = json.loads(_autosave_path(brand_key).read_text(encoding="utf-8"))
+    except Exception:
+        if force:
+            _session["plan"] = None
+            _session["image_paths"] = {}
+            _session["stories"] = []
+            _session["batch"] = []
+        return
+    _session["plan"] = data.get("plan")
+    _session["stories"] = data.get("stories", []) or []
+    _session["batch"] = data.get("batch", []) or []
+    imgs = data.get("image_paths") or {}
+    _session["image_paths"] = {k: v for k, v in imgs.items() if v and Path(v).exists()}
+
+
+def _autosave_stash(brand_key: str, **fields) -> None:
+    """Merge specific fields (plan / stories / image_paths) into a brand's
+    autosave WITHOUT touching the live session — for an in-flight job (fetch /
+    generate) that finished after the user switched to a different brand."""
+    p = _autosave_path(brand_key)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    data.update(fields)
+    data.setdefault("plan", None)
+    data.setdefault("stories", [])
+    data.setdefault("image_paths", {})
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[autosave] stash failed: {e}")
 
 
 # Single-flight guard: only one heavy LLM job (fetch/plan/batch) at a time so a
@@ -194,28 +264,55 @@ def _sync_fetch_stories(limit, top_n, category, model, exclude=(), brand_key=Non
     return [vars(r) for r in ranked]
 
 
-def _sync_generate_plan(story_dict, total_slides, model, tone=""):
+def _sync_generate_plan(story_dict, total_slides, model, tone="",
+                        platform="instagram", content_type="general", manual=False):
     from feeds import Story
     from plan import plan_story
     from brands import resolve_brand
+    if manual:
+        # Manual Create is deliberately isolated from fetched-story metadata.
+        # Only the text the user typed may reach the planner.
+        story_dict = {
+            "title": str(story_dict.get("title") or "").strip(),
+            "summary": str(story_dict.get("summary") or "").strip(),
+            "url": "", "published": "", "image": "",
+        }
     story  = Story(**story_dict)
     config = _cfg()
     brand  = resolve_brand(config)
+    allowed_types = [item.get("value") for item in brand.get("content_types", [])
+                     if isinstance(item, dict) and item.get("value")]
+    if content_type != "general" and content_type not in allowed_types:
+        content_type = allowed_types[0] if allowed_types else "general"
     return plan_story(story, config, total_slides=total_slides, model=model,
-                      brand=brand, tone=tone)
+                      brand=brand, tone=tone, platform=platform,
+                      content_type=content_type,
+                      polish_personality=not manual,
+                      manual_mode=manual)
 
 
-def _sync_suggest_angles(idea, tone=""):
+def _sync_suggest_angles(idea, tone="", platform="instagram",
+                         content_type="educational"):
     """Propose a few alternative carousel angles/headlines for a manual idea."""
     from llm import chat_json
     from brands import resolve_brand
     config = _cfg()
     brand  = resolve_brand(config)
     bn = brand.get("name", "the brand")
+    allowed_types = [item.get("value") for item in brand.get("content_types", [])
+                     if isinstance(item, dict) and item.get("value")]
+    if content_type not in allowed_types:
+        content_type = allowed_types[0] if allowed_types else "general"
+    platform_label = {"instagram": "Instagram", "linkedin": "LinkedIn",
+                      "facebook": "Facebook", "x": "X"}.get(platform, "Instagram")
+    from plan import CONTENT_TYPE_LABELS
+    type_label = CONTENT_TYPE_LABELS.get(content_type, "General")
     system = (f"You are a social content strategist for {bn}. Given a rough idea, propose "
-              "4 DISTINCT, punchy Instagram carousel angles (each a different take, max 70 "
+              f"4 DISTINCT, punchy {platform_label} {type_label} carousel angles "
+              "(each a different take, max 70 "
               'chars). Return ONLY JSON: {"angles": ["...", "...", "...", "..."]}')
-    user = f"Idea: {idea}\nTone: {tone or 'default brand voice'}"
+    user = (f"Idea: {idea}\nPlatform: {platform_label}\nContent type: {type_label}\n"
+            f"Tone: {tone or 'default brand voice'}")
     out = chat_json(system, user)
     angles = out.get("angles") if isinstance(out, dict) else None
     return [a.strip() for a in (angles or []) if isinstance(a, str) and a.strip()][:4]
@@ -229,7 +326,7 @@ def _sync_regen_caption(plan, tone):
 
 
 def _sync_generate_scripts(story_dict, topic, keywords, platform, content_type,
-                           num_variants, duration, model):
+                           num_variants, duration, model, outline, hook, cta):
     from feeds import Story
     from scripts import generate_scripts
     from brands import resolve_brand
@@ -239,7 +336,7 @@ def _sync_generate_scripts(story_dict, topic, keywords, platform, content_type,
     return generate_scripts(
         story=story, topic=topic, keywords=keywords, brand=brand, config=config,
         platform=platform, content_type=content_type, num_variants=num_variants,
-        duration=duration, model=model,
+        duration=duration, model=model, outline=outline, hook=hook, cta=cta,
     )
 
 
@@ -398,7 +495,11 @@ def _render_item(story_dict, fmt, *, config, brand, brand_key, out_root,
         plan = plan_post(story, fmt, config=config, total_slides=total_slides,
                          model=model, brand=brand, tone=tone)
         # Multi-image (carousel/listicle) vs single-card image fetch.
-        if fmt in CAROUSEL_FORMATS:
+        # source == "none": skip image fetching entirely — render blank backgrounds,
+        # fast, and add images by hand in the Editor afterwards.
+        if source == "none":
+            img_paths = None
+        elif fmt in CAROUSEL_FORMATS:
             img_paths = fetch_images_for_plan(plan, source=source)
         else:
             img_paths = None
@@ -416,6 +517,10 @@ def _render_item(story_dict, fmt, *, config, brand, brand_key, out_root,
         out_dir = generate_post(plan, fmt, img_paths, out_root=out_root,
                                 brand_key=brand_key)
         files   = sorted(p.name for p in Path(out_dir).glob("*.png"))
+        # True only if at least one slide actually got a background image — lets
+        # the UI flag fully-blank renders (e.g. "No images (fast)" mode) before
+        # they're sent to Review/Postiz looking unfinished.
+        has_images = bool(img_paths) and any(img_paths.values())
         return {
             "title":       story.title,
             "format":      fmt,
@@ -427,6 +532,7 @@ def _render_item(story_dict, fmt, *, config, brand, brand_key, out_root,
             "image_query": plan.get("image_query", ""),
             "plan":        plan,
             "story":       story_dict,
+            "has_images":  has_images,
             "ok":          True,
         }
     except Exception as e:
@@ -600,6 +706,9 @@ async def api_batch_run(body: dict = Body(...)):
         out = await _run(_sync_batch_run, items, model, source, save, tone)
         out["elapsed"] = round(time.time() - t0, 1)
         _mark_used(*[(it.get("story") or {}).get("url") for it in items])
+        from brands import active_key
+        _session["batch"] = out.get("results", [])   # persist per-brand for switch/refresh
+        _autosave_write(active_key(_cfg()))
         return out
     except HTTPException:
         raise
@@ -930,6 +1039,30 @@ async def api_review_delete(rid: str):
     return {"ok": True}
 
 
+@app.delete("/api/outputs/{rel:path}")
+async def api_delete_output(rel: str):
+    """Discard a rendered result you don't plan to use: deletes its output
+    folder, drops any matching Review-queue entries, and removes it from this
+    brand's persisted batch (so it doesn't reappear on refresh)."""
+    base = Path("outputs").resolve()
+    target = (base / rel).resolve()
+    if base not in target.parents:
+        raise HTTPException(400, "Invalid path.")
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+
+    before = _review_load()
+    items = [i for i in before if i.get("rel") != rel]
+    removed_review = len(before) - len(items)
+    if removed_review:
+        _review_save(items)
+
+    _session["batch"] = [b for b in _session.get("batch", []) if b.get("rel") != rel]
+    from brands import active_key
+    _autosave_write(active_key(_cfg()))
+    return {"ok": True, "removed_review": removed_review}
+
+
 @app.post("/api/review/enqueue")
 async def api_review_enqueue(body: dict = Body(default={})):
     """Push an already-rendered post into the review queue. Used by the Editor's
@@ -1058,7 +1191,38 @@ async def api_session_reset(body: dict = Body(default={})):
     return {"ok": True, "cleared": n}
 
 
+@app.post("/api/session/clear")
+async def api_session_clear(body: dict = Body(default={})):
+    """Clear autosaved work without deleting saved Library items or outputs."""
+    scope = body.get("scope", "all")
+    if scope not in {"editor", "all"}:
+        raise HTTPException(400, "scope must be 'editor' or 'all'")
+
+    _session["plan"] = None
+    _session["image_paths"] = {}
+    _session["rendered_dir"] = None
+    if scope == "all":
+        _session["stories"] = []
+        _session["batch"] = []
+        _session["bulk_progress"] = None
+    _autosave_write()
+    return {"ok": True, "scope": scope}
+
+
 # ── API: brands ────────────────────────────────────────────────────────────────
+def _brand_content_types(brand: dict) -> list[dict[str, str]]:
+    """Return only safe, complete content-type definitions to the browser."""
+    return [
+        {
+            "value": str(item["value"]),
+            "label": str(item.get("label") or item["value"]),
+            "description": str(item.get("description") or ""),
+        }
+        for item in brand.get("content_types", [])
+        if isinstance(item, dict) and item.get("value")
+    ]
+
+
 @app.get("/api/brands")
 async def api_brands():
     from brands import list_brands, active_key
@@ -1089,6 +1253,7 @@ async def api_brand():
         "accent2": t.get("accent2", "#00C896"),
         "navy":    t.get("navy", "#0A0F1E"),
         "text":    t.get("text", "#FFFFFF"),
+        "content_types": _brand_content_types(b),
     }
 
 
@@ -1109,20 +1274,22 @@ async def api_set_brand(body: dict = Body(...)):
     config = _cfg()
     if key not in list_brands(config):
         raise HTTPException(404, f"Unknown brand '{key}'")
+    _autosave_write()          # save the CURRENT brand's in-progress work first
     set_active(key)
-    # Switching brand means different feeds/voice — clear story/plan context.
-    _session["stories"]     = []
-    _session["plan"]        = None
-    _session["image_paths"] = {}
-    _session["used_urls"]   = set()
+    # Switching brand: each brand keeps its own work — restore the target brand's
+    # saved plan + images + fetched stories (or empty). Dedup is per-brand/session.
+    _session["used_urls"] = set()
+    _autosave_restore(force=True)
     b = resolve_brand(config)
     return {
         "ok":     True,
+        "key":    active_key(config),
         "active": active_key(config),
         "name":   b.get("name", ""),
         "logo":   "/" + b.get("logo_path", "static/logo.png"),
         "shape":  b.get("logo_shape", "round"),
         "accent": b.get("theme", {}).get("accent", "#00B4C8"),
+        "content_types": _brand_content_types(b),
     }
 
 
@@ -1315,7 +1482,13 @@ async def api_fetch_stories(
         exclude = _used_all()   # session + persisted: never re-serve posted content
         ranked = await _run(_sync_fetch_stories, limit, top, category or None,
                             model or None, exclude, bkey)
-        _session["stories"] = ranked
+        from brands import active_key
+        eff_brand = bkey or active_key(_cfg())   # the brand actually fetched/scored for
+        if active_key(_cfg()) == eff_brand:
+            _session["stories"] = ranked          # still on this brand → update live view
+            _autosave_write(eff_brand)
+        else:
+            _autosave_stash(eff_brand, stories=ranked)   # switched away → stash for return
         elapsed = round(time.time() - t0, 1)
         return {"stories": ranked, "elapsed": elapsed, "excluded": len(exclude)}
     except HTTPException:
@@ -1336,7 +1509,10 @@ async def api_manual_suggest(body: dict = Body(default={})):
     _apply_brand(body.get("brand"))
     _acquire("suggest angles")
     try:
-        angles = await _run(_sync_suggest_angles, idea, body.get("tone", ""))
+        angles = await _run(
+            _sync_suggest_angles, idea, body.get("tone", ""),
+            body.get("platform", "instagram"), body.get("content_type", "educational"),
+        )
         return {"angles": angles}
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -1350,16 +1526,26 @@ async def api_generate_plan(body: dict = Body(...)):
     total       = body.get("total_slides") or None
     model       = body.get("model") or None
     tone        = body.get("tone", "")
+    platform    = body.get("platform", "instagram")
+    content_type = body.get("content_type", "general")
+    manual      = bool(body.get("manual", False))
     _apply_brand(body.get("brand"))
+    from brands import active_key
+    gen_brand = body.get("brand") or active_key(_cfg())   # the brand this plan is for
     _acquire("generate plan")
     t0 = time.time()
     try:
-        plan = await _run(_sync_generate_plan, story, total, model, tone)
-        _session["plan"]        = plan
-        _session["image_paths"] = {}
+        plan = await _run(_sync_generate_plan, story, total, model, tone,
+                          platform, content_type, manual)
+        if active_key(_cfg()) == gen_brand:
+            _session["plan"]        = plan      # still on this brand → live view
+            _session["image_paths"] = {}
+            _autosave_write(gen_brand)
+        else:
+            _autosave_stash(gen_brand, plan=plan, image_paths={})   # switched away → stash
         _mark_used(story.get("url"))
         elapsed = round(time.time() - t0, 1)
-        return {"plan": plan, "elapsed": elapsed}
+        return {"plan": plan, "elapsed": elapsed, "brand": gen_brand}
     except HTTPException:
         raise
     except Exception as e:
@@ -1381,6 +1567,11 @@ async def api_generate_scripts(body: dict = Body(...)):
     num_variants = body.get("num_variants") or 3
     duration     = body.get("duration") or 30
     model        = body.get("model") or None
+    outline      = body.get("outline") or []
+    if isinstance(outline, str):
+        outline = [ln.strip() for ln in outline.splitlines() if ln.strip()]
+    hook         = (body.get("hook") or "").strip()
+    cta          = (body.get("cta") or "").strip()
     if not story and not topic:
         raise HTTPException(400, "Provide a topic or select a story.")
     _apply_brand(body.get("brand"))
@@ -1388,7 +1579,8 @@ async def api_generate_scripts(body: dict = Body(...)):
     t0 = time.time()
     try:
         scripts = await _run(_sync_generate_scripts, story, topic, keywords,
-                             platform, content_type, num_variants, duration, model)
+                             platform, content_type, num_variants, duration, model,
+                             outline, hook, cta)
         elapsed = round(time.time() - t0, 1)
         return {"scripts": scripts, "elapsed": elapsed}
     except HTTPException:
@@ -1437,6 +1629,79 @@ async def api_generate_video(body: dict = Body(...)):
         _release()
 
 
+# ── video_reels mode: analyze → editable manifest → render → Postiz ─────────────
+_VR_UI_MANIFEST = Path("library/manifests/_ui.json")
+
+
+def _sync_vr_analyze(url, rss, mode, aspect, clip_method, brand_key):
+    import video_reels as vr
+    _VR_UI_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    m = vr.emit_manifest(rss=rss or "", url=url or "", mode=mode, aspect=aspect,
+                         clip_method=clip_method, out_path=str(_VR_UI_MANIFEST),
+                         brand_key=brand_key or None)
+    m["source"]["rights_cleared"] = True   # using the tool asserts your rights
+    _VR_UI_MANIFEST.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+    return m
+
+
+def _sync_vr_render(manifest, send):
+    import video_reels as vr
+    _VR_UI_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    _VR_UI_MANIFEST.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return vr.render_from_manifest(str(_VR_UI_MANIFEST), send=send)
+
+
+@app.post("/api/vreels/analyze")
+async def api_vreels_analyze(body: dict = Body(...)):
+    """Resolve a YouTube source, write the AI copy + auto-picked clips into an
+    editable manifest, and return it. No render yet."""
+    url  = (body.get("url") or "").strip()
+    rss  = (body.get("rss") or "").strip()
+    if not (url or rss):
+        raise HTTPException(400, "Provide a YouTube URL (or an RSS feed).")
+    mode    = body.get("mode", "reel")
+    aspect  = body.get("aspect", "9:16")
+    method  = body.get("clip_method", "even_intervals")
+    _apply_brand(body.get("brand"))
+    from brands import active_key
+    bkey = body.get("brand") or active_key(_cfg())
+    _acquire("analyze video")
+    t0 = time.time()
+    try:
+        m = await _run(_sync_vr_analyze, url, rss, mode, aspect, method, bkey)
+        return {"manifest": m, "elapsed": round(time.time() - t0, 1)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        _release()
+
+
+@app.post("/api/vreels/render")
+async def api_vreels_render(body: dict = Body(...)):
+    """Render the (edited) manifest to branded clips/reel, optionally pushing a
+    Postiz draft. Returns preview URLs under /video_cache."""
+    manifest = body.get("manifest")
+    if not manifest:
+        raise HTTPException(400, "No manifest to render.")
+    send = bool(body.get("send"))
+    _acquire("render video")
+    t0 = time.time()
+    try:
+        res = await _run(_sync_vr_render, manifest, send)
+        res["assets_url"] = ["/video_cache/" + Path(a).relative_to("video_cache").as_posix()
+                             for a in res.get("assets", [])]
+        res["elapsed"] = round(time.time() - t0, 1)
+        return res
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        _release()
+
+
 @app.get("/api/plan")
 async def api_get_plan():
     if not _session["plan"]:
@@ -1466,12 +1731,15 @@ async def api_regen_caption(body: dict = Body(default={})):
 
 @app.get("/api/session")
 async def api_get_session():
-    """Snapshot of server-side state so the UI can restore after a refresh."""
+    """Snapshot of server-side state so the UI can restore after a refresh — or
+    after a server restart, via the on-disk per-brand autosave."""
+    _autosave_restore()
     busy = _busy["job"] if (_busy["job"] and (time.time() - _busy["since"]) < _BUSY_TIMEOUT) else None
     return {
         "plan":        _session.get("plan"),
         "stories":     _session.get("stories", []),
         "image_paths": _session.get("image_paths", {}),
+        "batch":       _session.get("batch", []),
         "busy":        busy,
         "progress":    _session.get("bulk_progress"),
     }
@@ -1488,6 +1756,7 @@ async def api_load_dummy():
 @app.put("/api/plan")
 async def api_update_plan(plan: dict = Body(...)):
     _session["plan"] = plan
+    _autosave_write()          # every keystroke-synced edit persists to disk
     return {"ok": True}
 
 
@@ -1502,6 +1771,7 @@ async def api_fetch_images(body: dict = Body(default={})):
     try:
         paths = await _run(_sync_fetch_images, plan, source)
         _session["image_paths"] = paths
+        _autosave_write()
         elapsed = round(time.time() - t0, 1)
         return {"image_paths": paths, "elapsed": elapsed}
     except Exception as e:
@@ -1517,6 +1787,7 @@ async def api_swap_image(slide_idx: int, body: dict = Body(...)):
     try:
         path = await _run(_sync_swap_pexels, query, source)
         _session["image_paths"][str(slide_idx)] = path
+        _autosave_write()
         return {"path": path, "filename": Path(path).name}
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -1549,6 +1820,7 @@ async def api_image_from_url(body: dict = Body(...)):
         path = await _run(_sync_fetch_url, url, name or None, do_filter)
         if sidx is not None:
             _session["image_paths"][str(sidx)] = path
+            _autosave_write()
         return {"path": path, "filename": Path(path).name}
     except Exception as e:
         # A bad/unreachable/non-image URL is a client problem, not a server fault.
@@ -1572,12 +1844,14 @@ async def api_image_upload(slide_idx: int, file: UploadFile = File(...)):
     dest.write_bytes(data)
     path = dest.as_posix()
     _session["image_paths"][str(slide_idx)] = path
+    _autosave_write()
     return {"path": path, "filename": dest.name}
 
 
 @app.delete("/api/images/{slide_idx}")
 async def api_clear_image(slide_idx: int):
     _session["image_paths"].pop(str(slide_idx), None)
+    _autosave_write()
     return {"ok": True}
 
 
@@ -1941,8 +2215,9 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 .preview-pane{flex:1;display:flex;flex-direction:column;overflow:hidden;}
 .preview-nav{display:flex;align-items:center;gap:8px;}
 .slide-cnt{font-size:12px;color:var(--muted);min-width:52px;text-align:center;}
-.preview-wrap{flex:1;overflow:hidden;display:flex;align-items:center;justify-content:center;padding:14px;background:#070b14;}
-.preview-wrap img{max-height:100%;max-width:100%;border-radius:5px;object-fit:contain;box-shadow:0 8px 32px rgba(0,0,0,.6);}
+.preview-wrap{flex:1;overflow:auto;display:flex;align-items:flex-start;justify-content:center;padding:14px;background:#070b14;}
+.preview-wrap .preview-image-shell{position:relative;display:inline-block;flex:0 0 auto;max-width:100%;}
+.preview-wrap img{display:block;max-width:100%;height:auto;border-radius:5px;object-fit:contain;box-shadow:0 8px 32px rgba(0,0,0,.6);}
 .preview-placeholder{color:var(--muted);text-align:center;font-size:13px;line-height:1.6;}
 /* Image from URL row */
 .url-row{display:flex;gap:6px;align-items:center;}
@@ -2379,6 +2654,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
     <button class="nav-btn"       onclick="showTab('templates',this)">📄 Templates</button>
     <button class="nav-btn"       onclick="showTab('library',this)">📚 Library</button>
     <div class="nav-section">Video</div>
+    <button class="nav-btn"       onclick="showTab('vcreate',this)">✨ Create Video</button>
     <button class="nav-btn"       onclick="showTab('video',this)">🎬 Reels / Video</button>
     <div class="nav-section">Scripts</div>
     <button class="nav-btn"       onclick="showTab('scripts',this)">📝 Scripts</button>
@@ -2434,10 +2710,12 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 <div id="tab-create" class="tab active">
   <div class="stories-toolbar" style="flex-wrap:wrap;">
     <b style="font-size:14px;color:#fff;">✍️ Create a post</b>
-    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Give an idea, optional points, slide count and images — the AI writes the carousel, you refine it in the Editor.</span>
+    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Choose the platform and purpose, then give your idea and key points — the AI shapes the post for that audience.</span>
   </div>
   <div style="flex:1;overflow-y:auto;padding:22px;display:flex;justify-content:center;">
     <div style="width:100%;max-width:640px;display:flex;flex-direction:column;gap:16px;">
+
+      <button class="btn btn-danger btn-sm" onclick="clearCreateSession()" style="align-self:flex-end;" title="Clear this brand's current Create and Editor session">Start fresh</button>
 
       <div class="field-group">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
@@ -2449,6 +2727,28 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
                onkeydown="if(event.key==='Enter'){event.preventDefault();manualGenerate();}">
         <div id="m-angles" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;"></div>
       </div>
+
+      <div style="display:flex;gap:16px;flex-wrap:wrap;">
+        <div class="field-group" style="flex:1;min-width:220px;">
+          <label>Platform <span style="color:var(--red);">*</span></label>
+          <select id="m-platform" class="src-sel" style="width:100%;" onchange="updateManualContext()">
+            <option value="instagram" selected>Instagram</option>
+            <option value="linkedin">LinkedIn</option>
+            <option value="facebook">Facebook</option>
+            <option value="x">X (Twitter)</option>
+          </select>
+        </div>
+        <div class="field-group" style="flex:1;min-width:220px;">
+          <label>Content type <span style="color:var(--red);">*</span></label>
+          <select id="m-content-type" class="src-sel" style="width:100%;" onchange="updateManualContext()">
+            <option value="">Loading brand options…</option>
+          </select>
+        </div>
+      </div>
+      <div id="m-context-hint" style="margin-top:-10px;padding:10px 12px;border:1px solid var(--border);border-radius:7px;background:rgba(255,255,255,.02);font-size:11px;line-height:1.5;color:var(--muted);">
+        Loading content options for the active brand…
+      </div>
+      <div style="font-size:11px;color:var(--muted);">Manual source only: the AI uses the idea and notes entered here. RSS stories and previous posts are not included.</div>
 
       <div class="field-group">
         <label>Key points / notes <span style="color:var(--muted);font-weight:400;">(optional — the AI structures these into slides)</span></label>
@@ -2480,7 +2780,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
       </div>
 
       <button class="btn btn-green" id="m-gen" onclick="manualGenerate()" style="align-self:flex-start;font-size:14px;padding:11px 22px;">✨ Generate post</button>
-      <div style="font-size:11px;color:var(--muted);">It opens in the Editor with a caption, hashtags and per-slide image suggestions — tweak anything, then Render &amp; Send to Review.</div>
+      <div style="font-size:11px;color:var(--muted);">It opens in the Editor with platform-appropriate copy, caption, hashtags and per-slide image suggestions — tweak anything, then Render &amp; Send to Review.</div>
     </div>
   </div>
 </div>
@@ -2521,7 +2821,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
       <option value="analytical, measured">Analytical</option>
       <option value="skeptical, cautionary">Skeptical</option>
     </select>
-    <select id="batch-src" class="src-sel"><option value="pexels">Pexels</option><option value="unsplash">Unsplash</option><option value="google">Google</option><option value="feed">📰 Article</option></select>
+    <select id="batch-src" class="src-sel"><option value="none">🚫 No images (fast)</option><option value="pexels">Pexels</option><option value="unsplash">Unsplash</option><option value="google">Google</option><option value="feed">📰 Article</option></select>
     <button class="btn btn-green" onclick="runBatch()" id="btn-batch">Generate All Selected</button>
     <button class="btn btn-danger btn-sm" id="btn-cancel-batch" style="display:none;" onclick="cancelJob()">⨯ Cancel</button>
   </div>
@@ -2551,7 +2851,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
       <option value="skeptical, cautionary">Skeptical</option>
     </select></label>
     <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Images</span>
-    <select id="bulk-src" class="src-sel"><option value="pexels">Pexels</option><option value="unsplash">Unsplash</option><option value="google">Google</option><option value="feed">📰 Article</option></select></label>
+    <select id="bulk-src" class="src-sel"><option value="none">🚫 No images (fast)</option><option value="pexels">Pexels</option><option value="unsplash">Unsplash</option><option value="google">Google</option><option value="feed">📰 Article</option></select></label>
     <span id="bulk-total" style="font-size:12px;color:var(--muted);font-weight:700;">0 posts</span>
     <button class="btn btn-green" onclick="runBulk()" id="btn-bulk-run">⚡ Generate All</button>
     <button class="btn btn-danger btn-sm" id="btn-bulk-cancel" style="display:none;" onclick="cancelJob()">⨯ Cancel</button>
@@ -2636,7 +2936,7 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 <div id="tab-scripts" class="tab" style="flex-direction:column;">
   <div class="stories-toolbar" style="flex-wrap:wrap;gap:8px;">
     <b style="font-size:14px;color:#fff;">📝 Scripts</b>
-    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Generate platform-specific voiceover scripts (with beat timing + captions) from a story or topic.</span>
+    <span class="tb-hint" style="font-size:11px;color:var(--muted);">Voiceover scripts from a story or <b>your own topic</b> — give an outline &amp; the AI writes timed, editable segments (hook → beats → CTA).</span>
     <div class="tb-spacer"></div>
   </div>
   <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;">
@@ -2684,6 +2984,23 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
     </label>
     <button class="btn btn-primary" id="btn-scr-gen" onclick="generateScripts()">📝 Generate scripts</button>
   </div>
+  <details style="border-bottom:1px solid var(--border);padding:0 18px;">
+    <summary style="cursor:pointer;font-size:12px;color:var(--muted);padding:10px 0;">✍️ Your structure (optional) — an outline, hook &amp; CTA the AI will follow</summary>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start;padding-bottom:12px;">
+      <label class="tb-group" style="flex-direction:column;align-items:stretch;gap:3px;flex:2 1 320px;">
+        <span style="font-size:11px;color:var(--muted);">Your outline / beats (one per line → one segment each)</span>
+        <textarea id="scr-outline" class="model-sel" rows="4" style="width:100%;resize:vertical;font-family:inherit;" placeholder="open with the problem&#10;show the 3-step fix&#10;proof point&#10;wrap up"></textarea>
+      </label>
+      <label class="tb-group" style="flex-direction:column;align-items:stretch;gap:3px;flex:1 1 220px;">
+        <span style="font-size:11px;color:var(--muted);">Your hook (optional)</span>
+        <input id="scr-hook" class="model-sel" style="width:100%;" placeholder="the exact opening line">
+      </label>
+      <label class="tb-group" style="flex-direction:column;align-items:stretch;gap:3px;flex:1 1 220px;">
+        <span style="font-size:11px;color:var(--muted);">Your CTA (optional)</span>
+        <input id="scr-cta" class="model-sel" style="width:100%;" placeholder="the exact closing call to action">
+      </label>
+    </div>
+  </details>
   <div id="scripts-list" class="stories-list">
     <div style="color:var(--muted);font-size:13px;text-align:center;padding:40px 20px;line-height:1.6;">
       <div style="font-size:34px;margin-bottom:10px;">📝</div>
@@ -2693,6 +3010,37 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
 </div>
 
 <!-- ═══════════ VIDEO ════════════════════════════════════════════════════ -->
+<!-- ═══════════ VIDEO CREATE (video_reels) ═══════════════════════════════════ -->
+<div id="tab-vcreate" class="tab" style="flex-direction:column;">
+  <div class="stories-toolbar" style="flex-wrap:wrap;gap:10px;">
+    <b style="font-size:14px;color:#fff;">✨ Create Video</b>
+    <input id="vc-url" class="url-inp" placeholder="Paste a YouTube URL…" style="flex:1;min-width:220px;">
+    <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Output</span>
+      <select id="vc-mode" class="src-sel" onchange="vcModeChanged()">
+        <option value="reel">Reel (9:16)</option>
+        <option value="carousel">Carousel</option>
+      </select></label>
+    <label class="tb-group" id="vc-aspect-wrap" style="display:none;"><span style="font-size:11px;color:var(--muted);">Aspect</span>
+      <select id="vc-aspect" class="src-sel">
+        <option value="9:16">9:16</option><option value="4:5" selected>4:5</option>
+        <option value="1:1">1:1</option><option value="16:9">16:9</option>
+      </select></label>
+    <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Clips</span>
+      <select id="vc-method" class="src-sel">
+        <option value="even_intervals">Even</option><option value="scene_cut">Scene-cut</option>
+      </select></label>
+    <button class="btn btn-primary" id="vc-analyze" onclick="vcAnalyze()">🔎 Analyze</button>
+  </div>
+  <div id="vc-body" class="stories-list" style="padding:14px;gap:14px;">
+    <div style="color:var(--muted);font-size:13px;text-align:center;padding:40px 20px;line-height:1.6;">
+      <div style="font-size:34px;margin-bottom:10px;">✨</div>
+      Paste a YouTube URL and <b>Analyze</b> — the AI writes the hook / title / CTA copy and
+      auto-picks the clip moments. Then tweak the clips, copy, and framing, and <b>Render</b> →
+      <b>Send to Postiz</b>.
+    </div>
+  </div>
+</div>
+
 <div id="tab-video" class="tab" style="flex-direction:column;">
   <div class="stories-toolbar" style="flex-wrap:wrap;gap:8px;">
     <b style="font-size:14px;color:#fff;">🎬 Reels / Video</b>
@@ -2717,18 +3065,13 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
     </label>
   </div>
   <div style="padding:10px 18px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:14px;align-items:center;">
-    <label class="tb-group" style="gap:7px;cursor:pointer;">
-      <input type="checkbox" id="vid-rights" style="width:16px;height:16px;cursor:pointer;">
-      <span style="font-size:12px;color:var(--text);">I have the rights to use this clip (fair use / licensed). <span style="color:var(--muted);">Required — you assert this; K2 Press does not verify it.</span></span>
-    </label>
     <div class="tb-spacer" style="flex:1;"></div>
     <button class="btn btn-primary" id="btn-vid-gen" onclick="generateVideo()">🎬 Generate reel</button>
   </div>
   <div id="video-result" class="stories-list" style="align-items:center;">
     <div style="color:var(--muted);font-size:13px;text-align:center;padding:40px 20px;line-height:1.6;">
       <div style="font-size:34px;margin-bottom:10px;">🎬</div>
-      Generate scripts first (📝 Scripts), then paste a YouTube URL, set start/end,
-      tick the rights box, and <b>Generate reel</b>.<br>
+      Paste a YouTube URL, set start/end, and <b>Generate reel</b>.<br>
       <span style="font-size:11px;">First run downloads the clip — give it a moment.</span>
     </div>
   </div>
@@ -2741,7 +3084,8 @@ nav{display:flex;flex-direction:column;gap:3px;padding:12px 10px;}
       <h3>Plan Editor</h3>
       <button class="btn btn-ghost btn-sm" onclick="savePlan()" title="Save this plan to your library">💾 Save</button>
       <button class="btn btn-ghost btn-sm" onclick="openLibrary()" title="Load a saved plan">📂 Library</button>
-      <button class="btn btn-ghost btn-sm" id="btn-source" onclick="viewSource()" title="Open the original article this post was generated from">🔗 Original</button>
+      <button class="btn btn-ghost btn-sm" id="btn-source" onclick="viewSource()" title="Open the original source article this post was generated from (Auto/RSS posts only)">🔗 Source</button>
+      <button class="btn btn-danger btn-sm" onclick="clearEditorSession()" title="Clear the current plan and its session images">Clear</button>
       <select id="slide-count-sel" style="background:#0d1828;border:1px solid var(--border);border-radius:5px;color:#fff;padding:3px 6px;font-size:12px;font-family:inherit;">
         <option value="3">3 slides</option>
         <option value="4" selected>4 slides</option>
@@ -2956,6 +3300,7 @@ let S = {
   plan: null,
   imagePaths: {},
   manualImages: [],       // Create tab: uploaded/pasted images, assigned to slides in order
+  reviewIndex: {},        // {rel: status} — last-known Review-queue status per rendered result
   slideIdx: 0,
   totalSlides: 0,
   selectedCat: '',
@@ -3104,22 +3449,47 @@ function applyBrandChrome(b) {
   });
   document.querySelectorAll('.js-brand-name').forEach(txt => { txt.textContent = b.name || ''; });
   if (b.accent) document.documentElement.style.setProperty('--teal', b.accent);
+  updateManualContentTypes(b);
 }
 
 async function switchBrand(key) {
-  if (S.busy) { toast(`Wait — '${S.busy}' is still running`, 'err'); return; }
+  // Brand-scoped LLM jobs (fetch/generate) are safe to switch during — their
+  // results land on the brand they were for. Heavier jobs (render/bulk) would
+  // clobber, so block and revert the dropdown to the real active brand.
+  const SAFE = [null, undefined, 'fetch stories', 'generate plan'];
+  if (!SAFE.includes(S.busy)) {
+    toast(`Wait — '${S.busy}' is still running`, 'err');
+    const sel = g('brand-sel'); if (sel && S.brandInfo) sel.value = S.brandInfo.key || sel.value;
+    return;
+  }
   try {
     const b = await api('/api/brand', 'PUT', { brand: key });
     applyBrandChrome(b);
-    // brand switch clears server context; reset the UI too
-    S.plan = null; S.stories = []; S.imagePaths = {}; S.batch = [];
-    document.getElementById('stories-list').innerHTML =
-      `<div style="color:var(--muted);text-align:center;padding:40px;font-size:13px;">
-         Switched to <b>${esc(b.name)}</b>. Click <b>Fetch &amp; Score</b> to pull its feeds.</div>`;
+    S.batch = [];
     document.getElementById('batch-bar').style.display = 'none';
-    document.getElementById('plan-form').innerHTML =
-      `<div style="color:var(--muted);text-align:center;padding:28px 10px;font-size:12px;">
-         Pick a story → plan loads here.</div>`;
+    // Each brand keeps its OWN work — restore this brand's fetched stories + plan.
+    const s = await api('/api/session').catch(() => ({}));
+    if (s && s.stories && s.stories.length) {
+      S.stories = s.stories;
+      renderStoriesList(s.stories);
+    } else {
+      S.stories = [];
+      document.getElementById('stories-list').innerHTML =
+        `<div style="color:var(--muted);text-align:center;padding:40px;font-size:13px;">
+           Switched to <b>${esc(b.name)}</b>. Click <b>Fetch &amp; Score</b> to pull its feeds.</div>`;
+    }
+    await restoreBatchView(s && s.batch);   // if this brand had generated results, show them
+    if (s && s.plan) {
+      loadPlan(s.plan);
+      S.imagePaths = s.image_paths || {};
+      Object.entries(S.imagePaths).forEach(([i,p]) => {
+        if (p) setThumb(parseInt(i), '/image_cache/' + p.split(/[/\\]/).pop()); });
+    } else {
+      S.plan = null; S.imagePaths = {};
+      document.getElementById('plan-form').innerHTML =
+        `<div style="color:var(--muted);text-align:center;padding:28px 10px;font-size:12px;">
+           Pick a story → plan loads here.</div>`;
+    }
     await Promise.all([loadCategories(true), loadFormats()]);
     toast(`Brand: ${b.name}`);
   } catch(e) { toast(e.message, 'err'); }
@@ -3134,6 +3504,7 @@ async function restoreSession() {
     S.stories = s.stories;
     renderStoriesList(s.stories);
   }
+  await restoreBatchView(s.batch);   // restore generated results across refresh
   if (s.plan) {
     loadPlan(s.plan);
     S.imagePaths = s.image_paths || {};
@@ -3354,6 +3725,9 @@ async function generateScripts() {
     duration:     parseInt(g('scr-dur').value || '30'),
     model:        g('model-sel').value,
     brand:        curBrand(),
+    outline:      g('scr-outline') ? g('scr-outline').value : '',   // your beats (one per line)
+    hook:         g('scr-hook') ? g('scr-hook').value.trim() : '',
+    cta:          g('scr-cta') ? g('scr-cta').value.trim() : '',
   };
 
   const btn = g('btn-scr-gen');
@@ -3383,7 +3757,14 @@ function renderScripts(scripts) {
     return;
   }
   list.innerHTML = scripts.map((s, i) => {
-    const beats = (s.beat_timestamps || []).map(b => b + 's').join(' · ');
+    const segs = s.segments || [];
+    const segHtml = segs.map((sg, j) => `
+      <div style="display:flex;gap:6px;align-items:flex-start;margin-bottom:6px;">
+        <input class="model-sel" style="width:88px;font-size:11px;" value="${esc(sg.label)}" oninput="scrSegSet(${i},${j},'label',this.value)" title="Segment label">
+        <input class="model-sel" type="number" step="0.5" min="0" style="width:64px;font-size:11px;" value="${sg.time}" oninput="scrSegSet(${i},${j},'time',parseFloat(this.value)||0)" title="Start (seconds)">
+        <textarea class="model-sel" rows="2" style="flex:1;font-size:12px;resize:vertical;font-family:inherit;" oninput="scrSegSet(${i},${j},'text',this.value)">${esc(sg.text)}</textarea>
+        <button class="btn btn-ghost btn-sm" onclick="scrSegDel(${i},${j})" title="Remove segment">✕</button>
+      </div>`).join('');
     const caps  = (s.captions || []).map(c =>
       `<div style="display:flex;gap:8px;font-size:12px;"><span style="color:var(--teal);min-width:42px;">${c.time}s</span><span>${esc(c.text)}</span></div>`).join('');
     return `<div class="story-card" style="cursor:default;">
@@ -3393,13 +3774,37 @@ function renderScripts(scripts) {
         <div style="flex:1;"></div>
         <button class="btn btn-ghost btn-sm" onclick='copyScript(${i})'>📋 Copy</button>
       </div>
-      ${s.hook ? `<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:4px;">🎬 ${esc(s.hook)}</div>` : ''}
-      <div style="font-size:13px;line-height:1.5;color:var(--text);white-space:pre-wrap;margin-bottom:8px;">${esc(s.voice_over)}</div>
+      ${s.hook ? `<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:6px;">🎬 ${esc(s.hook)}</div>` : ''}
+      ${segs.length ? `
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">Segments — edit the text or re-time any beat:</div>
+        ${segHtml}
+        <button class="btn btn-ghost btn-sm" onclick="scrSegAdd(${i})" style="margin-bottom:8px;">+ Add segment</button>
+        <details style="margin-bottom:6px;"><summary style="font-size:11px;color:var(--muted);cursor:pointer;">Full voiceover (read-through)</summary>
+          <div style="font-size:12px;line-height:1.5;color:var(--text);white-space:pre-wrap;margin-top:6px;">${esc((segs.map(x=>x.text).join(' ')) || s.voice_over)}</div></details>`
+      : `<div style="font-size:13px;line-height:1.5;color:var(--text);white-space:pre-wrap;margin-bottom:8px;">${esc(s.voice_over)}</div>`}
       ${s.cta ? `<div style="font-size:12px;color:var(--green);margin-bottom:8px;">➡ ${esc(s.cta)}</div>` : ''}
-      ${beats ? `<div style="font-size:11px;color:var(--muted);margin-bottom:6px;">Beats: ${esc(beats)}</div>` : ''}
       ${caps ? `<details style="margin-top:4px;"><summary style="font-size:11px;color:var(--muted);cursor:pointer;">Captions (${(s.captions || []).length})</summary><div style="margin-top:6px;display:flex;flex-direction:column;gap:3px;">${caps}</div></details>` : ''}
     </div>`;
   }).join('');
+}
+
+function scrSegSet(i, j, field, val) {
+  const s = (S.scripts || [])[i]; if (!s || !s.segments || !s.segments[j]) return;
+  s.segments[j][field] = val;
+  if (field === 'text' || field === 'time') s.voice_over = s.segments.map(x => x.text).join(' ');
+}
+function scrSegAdd(i) {
+  const s = (S.scripts || [])[i]; if (!s) return;
+  s.segments = s.segments || [];
+  const last = s.segments[s.segments.length - 1];
+  s.segments.push({ label: 'Beat ' + (s.segments.length), time: last ? (last.time + 3) : 0, text: '' });
+  renderScripts(S.scripts);
+}
+function scrSegDel(i, j) {
+  const s = (S.scripts || [])[i]; if (!s || !s.segments) return;
+  s.segments.splice(j, 1);
+  s.voice_over = s.segments.map(x => x.text).join(' ');
+  renderScripts(S.scripts);
 }
 
 function copyScript(i) {
@@ -3429,12 +3834,112 @@ function refreshVideoScriptSelect() {
   if (S.scripts && S.scripts.length && sel.value === '' ) sel.value = '0';
 }
 
+// ── Video Create (video_reels): analyze → edit manifest → render → Postiz ──────
+function vcModeChanged() {
+  const reel = g('vc-mode').value === 'reel';
+  g('vc-aspect-wrap').style.display = reel ? 'none' : '';   // reels = full 9:16
+}
+
+async function vcAnalyze() {
+  if (S.busy) { toast(`Wait — '${S.busy}' is running`, 'err'); return; }
+  const url = g('vc-url').value.trim();
+  if (!url) { toast('Paste a YouTube URL', 'err'); return; }
+  const mode = g('vc-mode').value;
+  const aspect = mode === 'reel' ? '9:16' : g('vc-aspect').value;
+  const btn = g('vc-analyze'); btn.disabled = true; btn.innerHTML = '<span class="spin"></span> Analyzing…';
+  S.busy = 'analyze video';
+  try {
+    const data = await api('/api/vreels/analyze', 'POST', {
+      url, mode, aspect, clip_method: g('vc-method').value, brand: curBrand() });
+    S.vmanifest = data.manifest;
+    vcRenderCards();
+    toast(`Analyzed (${data.elapsed}s) — tweak and render`);
+  } catch(e) { toast(e.message, 'err'); }
+  finally { S.busy = null; btn.disabled = false; btn.innerHTML = '🔎 Analyze'; }
+}
+
+function vcField(label, html) {
+  return `<div class="field-group" style="margin-bottom:8px;"><label>${label}</label>${html}</div>`;
+}
+
+function vcRenderCards() {
+  const m = S.vmanifest; if (!m) return;
+  const card = (c, i) => {
+    const t = c.text || {}, cr = c.crop || {};
+    let fields = '';
+    if (c.template === 'hook') {
+      fields = vcField('Lead', `<input class="url-inp" oninput="vcSet(${i},'text.lead',this.value)" value="${esc(t.lead||'')}">`)
+             + vcField('Body', `<textarea rows="2" oninput="vcSet(${i},'text.body',this.value)">${esc(t.body||'')}</textarea>`)
+             + vcField('Emoji', `<input class="url-inp" style="width:90px;" oninput="vcSet(${i},'text.emoji',this.value)" value="${esc(t.emoji||'')}">`);
+    } else if (c.template === 'title') {
+      fields = vcField('Title', `<input class="url-inp" oninput="vcSet(${i},'text.title',this.value)" value="${esc(t.title||'')}">`)
+             + vcField('Subtitle', `<input class="url-inp" oninput="vcSet(${i},'text.subtitle',this.value)" value="${esc(t.subtitle||'')}">`);
+    } else {
+      fields = vcField('CTA', `<textarea rows="2" oninput="vcSet(${i},'text.body',this.value)">${esc(t.body||'')}</textarea>`);
+    }
+    fields += vcField('Highlight words (comma)', `<input class="url-inp" oninput="vcSetHl(${i},this.value)" value="${esc((t.highlight||[]).join(', '))}">`);
+    return `<div class="story-card" style="cursor:default;">
+      <div class="s-top"><span class="score-pill badge badge-info">${esc(c.id)}</span></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin:8px 0;align-items:flex-end;">
+        <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Start (s)</span>
+          <input type="number" step="0.5" min="0" class="url-inp" style="width:90px;" value="${(c.clip&&c.clip.start)||0}" oninput="vcSet(${i},'clip.start',parseFloat(this.value)||0)"></label>
+        <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Length (s)</span>
+          <input type="number" step="0.5" min="0.5" class="url-inp" style="width:90px;" value="${(c.clip&&c.clip.duration)||4}" oninput="vcSet(${i},'clip.duration',parseFloat(this.value)||4)"></label>
+        <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Framing</span>
+          <select class="src-sel" onchange="vcSet(${i},'crop.fit',this.value)">
+            <option value="fill" ${cr.fit!=='fit'?'selected':''}>Fill (crop)</option>
+            <option value="fit" ${cr.fit==='fit'?'selected':''}>Fit (letterbox)</option>
+          </select></label>
+        <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Zoom</span>
+          <input type="number" step="0.05" min="1" max="3" class="url-inp" style="width:80px;" value="${cr.zoom||1}" oninput="vcSet(${i},'crop.zoom',parseFloat(this.value)||1)"></label>
+        <label class="tb-group"><span style="font-size:11px;color:var(--muted);">Focus ↕</span>
+          <input type="range" min="0" max="1" step="0.05" value="${cr.y!=null?cr.y:0.5}" oninput="vcSet(${i},'crop.y',parseFloat(this.value))"></label>
+      </div>
+      ${fields}
+    </div>`;
+  };
+  g('vc-body').innerHTML = `
+    ${m.cards.map((c,i)=>card(c,i)).join('')}
+    <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap;">
+      <button class="btn btn-primary" onclick="vcRender(false)">🎬 Render</button>
+      <button class="btn btn-green" onclick="vcRender(true)">✅ Render + Send to Postiz</button>
+    </div>
+    <div id="vc-preview" class="stories-list" style="gap:10px;flex-wrap:wrap;"></div>`;
+}
+
+function vcSet(i, path, val) {
+  const c = S.vmanifest && S.vmanifest.cards[i]; if (!c) return;
+  const parts = path.split('.');
+  if (parts.length === 2) { c[parts[0]] = c[parts[0]] || {}; c[parts[0]][parts[1]] = val; }
+  else c[path] = val;
+}
+function vcSetHl(i, val) {
+  S.vmanifest.cards[i].text.highlight = val.split(',').map(s=>s.trim()).filter(Boolean);
+}
+
+async function vcRender(send) {
+  const m = S.vmanifest; if (!m) { toast('Analyze first', 'err'); return; }
+  if (S.busy) { toast(`Wait — '${S.busy}' is running`, 'err'); return; }
+  const prev = g('vc-preview');
+  prev.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:10px;"><span class="spin"></span> Rendering… (downloads the video the first time)</div>';
+  S.busy = 'render video';
+  try {
+    const data = await api('/api/vreels/render', 'POST', { manifest: m, send });
+    prev.innerHTML = (data.assets_url||[]).map(u =>
+      `<video src="${u}?t=${Date.now()}" controls style="max-height:440px;border-radius:8px;border:1px solid var(--border);background:#000;"></video>`).join('');
+    if (send && data.postiz && data.postiz.post_id) toast('Rendered + sent to Postiz ✓ draft');
+    else if (send) toast('Rendered — Postiz returned no id', 'err');
+    else toast(`Rendered (${data.elapsed}s)`);
+  } catch(e) { prev.innerHTML = `<div style="color:var(--red);font-size:12px;padding:10px;">${esc(e.message)}</div>`; toast(e.message, 'err'); }
+  finally { S.busy = null; }
+}
+
 async function generateVideo() {
   if (S.busy) { toast(`Wait — '${S.busy}' is still running`, 'err'); return; }
   const url   = g('vid-url').value.trim();
   const start = parseFloat(g('vid-start').value || '0');
   const end   = parseFloat(g('vid-end').value || '0');
-  const rights = g('vid-rights').checked;
+  const rights = true;   // using the tool asserts your rights (gate kept server-side)
   const sIdx  = g('vid-script').value;
   const script = (sIdx !== '' && S.scripts[sIdx]) ? S.scripts[sIdx] : null;
 
@@ -3495,7 +4000,7 @@ function renderAgentTurn(data) {
   if (data.posts && data.posts.length) {
     html += `<div class="agent-posts">` + data.posts.map(p =>
       (p.files || []).slice(0, 1).map(f =>
-        `<a href="/outputs/${p.rel}/" target="_blank" title="${esc(p.title)}"><img src="/outputs/${p.rel}/${f}"></a>`
+        `<a href="/outputs/${p.rel}/" target="_blank" title="${esc(p.title)}"><img src="/outputs/${p.rel}/${f}?t=${Date.now()}"></a>`
       ).join('')).join('') + `</div>`;
     html += `<div style="font-size:11px;color:var(--muted);margin-top:6px;">→ ${data.posts.length} post(s) sent to ✅ Review.</div>`;
     refreshReviewBadge();
@@ -3562,7 +4067,7 @@ async function loadReview() {
   } catch(e) { host.innerHTML = `<div style="color:var(--red);padding:20px;">${esc(e.message)}</div>`; }
 }
 function reviewCard(it) {
-  const imgs = (it.files || []).map(f => `<a href="/outputs/${it.rel}/${f}" target="_blank"><img src="/outputs/${it.rel}/${f}"></a>`).join('');
+  const imgs = (it.files || []).map(f => `<a href="/outputs/${it.rel}/${f}?t=${Date.now()}" target="_blank"><img src="/outputs/${it.rel}/${f}?t=${Date.now()}"></a>`).join('');
   const st = it.status || 'pending';
   const note = (it.publish && !it.publish.sent && st !== 'rejected')
     ? `<span style="font-size:10px;color:var(--muted);align-self:center;">${esc(it.publish.reason || it.publish.error || '')}</span>` : '';
@@ -3795,6 +4300,7 @@ async function runBulk() {
     const tone = g('bulk-tone').value || '';
     const data = await api('/api/bulk/run','POST',{groups,model,source,tone});
     g('hdr-timer').textContent = data.elapsed+'s';
+    await refreshReviewIndex();
     showBulkResults(data);
     const ok = data.results.filter(r=>r.ok).length;
     const note = data.cancelled ? ' (cancelled)' : '';
@@ -3851,6 +4357,26 @@ function showBulkResults(data) {
 }
 
 // Shared result-card renderer (used by single-brand batch + bulk). ri indexes S.results.
+// Pull the current Review-queue status for every item (keyed by output folder
+// "rel", which is unique per render) so bulk/batch cards can show a live
+// pending/approved/published/rejected indicator instead of just a used button.
+async function refreshReviewIndex() {
+  try {
+    const data = await api('/api/review');   // no status filter = all items
+    const idx = {};
+    (data.items || []).forEach(it => { if (it.rel) idx[it.rel] = it.status; });
+    S.reviewIndex = idx;
+  } catch (e) { /* non-fatal — cards just render without a badge */ }
+}
+
+function reviewBadgeHtml(rel) {
+  const st = rel && S.reviewIndex[rel];
+  if (!st) return '';
+  const icons = { pending: '📋 Pending Review', approved: '✅ Approved',
+                 published: '📤 Sent to Postiz', rejected: '✕ Rejected' };
+  return `<span class="rv-status ${esc(st)}" style="margin-left:auto;">${icons[st] || esc(st)}</span>`;
+}
+
 function resultCard(ri) {
   const r = S.results[ri];
   if (!r.ok) return `
@@ -3864,9 +4390,11 @@ function resultCard(ri) {
       <div class="s-top">
         <span class="score-pill badge badge-info">${esc(S.formats[r.format]||r.format)}</span>
         <span class="story-title">${esc(r.title)}</span>
+        <span id="rc-noimg-${ri}" class="rv-status rejected" title="Rendered with no background images — generated in 'No images (fast)' mode" style="${r.has_images === false ? '' : 'display:none;'}">⚠️ NO IMAGE</span>
+        <span id="rc-badge-${ri}">${reviewBadgeHtml(r.rel)}</span>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;" id="rc-imgs-${ri}">
-        ${r.files.map(f=>`<a href="/outputs/${r.rel}/${f}" target="_blank"><img src="/outputs/${r.rel}/${f}" style="height:120px;border-radius:5px;border:1px solid var(--border);"></a>`).join('')}
+        ${r.files.map(f=>`<a href="/outputs/${r.rel}/${f}?t=${Date.now()}" target="_blank"><img src="/outputs/${r.rel}/${f}?t=${Date.now()}" style="height:120px;border-radius:5px;border:1px solid var(--border);"></a>`).join('')}
       </div>
       <div class="story-reason" style="white-space:pre-wrap;">${esc(r.caption||'')}</div>
       <div class="story-actions" style="margin-top:8px;flex-wrap:wrap;">
@@ -3874,8 +4402,24 @@ function resultCard(ri) {
                      : `<button class="btn btn-green btn-sm" onclick="suggestForResult(${ri})">✨ Suggest images</button>`}
         <button class="btn btn-green btn-sm" onclick="sendResultToReview(${ri}, this)">✓ Send to Review</button>
         <a href="/outputs/${r.rel}/" target="_blank" class="btn btn-ghost btn-sm">Open folder ↗</a>
+        <button class="btn btn-danger btn-sm" onclick="discardResult(${ri})" title="Delete this post — removes the rendered files and any Review-queue entry" style="margin-left:auto;">🗑 Discard</button>
       </div>
     </div>`;
+}
+
+// Discard a result you don't plan to use: deletes its rendered files + any
+// Review-queue entry, and removes the card from view (no full re-render, so
+// other cards / their onclick indices stay valid).
+async function discardResult(ri) {
+  const r = S.results[ri];
+  if (!r || !r.rel) return;
+  if (!confirm(`Discard "${r.title}"? This deletes the rendered files${S.reviewIndex[r.rel] ? ' and its Review-queue entry' : ''}.`)) return;
+  try {
+    await api('/api/outputs/' + r.rel.split('/').map(encodeURIComponent).join('/'), 'DELETE');
+    document.getElementById('rc-' + ri)?.remove();
+    delete S.reviewIndex[r.rel];
+    toast('Discarded');
+  } catch (e) { toast(e.message, 'err'); }
 }
 
 // Load a result's carousel/listicle plan into the editor.
@@ -3890,6 +4434,7 @@ async function editResultPlan(ri) {
   }
   loadPlan(r.plan);
   S.imagePaths = {};
+  S.editingResultIndex = ri;   // so a later Render here can refresh THIS card's thumbnails/badge
   await api('/api/plan','PUT',r.plan).catch(()=>{});
   showTab('editor', document.querySelectorAll('.nav-btn')[2]);
   toast('Loaded into editor — tweak then Render');
@@ -3953,7 +4498,12 @@ async function fetchStories() {
     document.getElementById('hdr-timer').textContent = ((Date.now()-t0)/1000).toFixed(1)+'s';
   }, 200);
   try {
-    const data = await api(`/api/stories/fetch?limit=${limit}&top=${top}&category=${S.selectedCat}&model=${encodeURIComponent(model)}&brand=${encodeURIComponent(curBrand())}`, 'POST');
+    const fetchBrand = curBrand();   // the brand this fetch is for
+    const data = await api(`/api/stories/fetch?limit=${limit}&top=${top}&category=${S.selectedCat}&model=${encodeURIComponent(model)}&brand=${encodeURIComponent(fetchBrand)}`, 'POST');
+    if (curBrand() !== fetchBrand) {  // user switched brands mid-fetch — results were stashed server-side
+      toast(`${fetchBrand} fetch done (saved) — you're on ${curBrand()} now`);
+      return;                          // don't clobber the current brand's view
+    }
     S.stories = data.stories;
     renderStoriesList(data.stories);
     const cancelNote = S.cancelRequested ? ' · cancelled' : '';
@@ -4060,6 +4610,7 @@ async function runBatch() {
     const tone = document.getElementById('tone-sel')?.value || '';
     const data = await api('/api/batch/run','POST',{items,model,source,tone,brand:curBrand()});
     document.getElementById('hdr-timer').textContent = data.elapsed+'s';
+    await refreshReviewIndex();
     showBatchResults(data);
     const ok = data.results.filter(r=>r.ok).length;
     const note = data.cancelled ? ' (cancelled)' : '';
@@ -4077,6 +4628,14 @@ async function runBatch() {
   }
 }
 
+// Restore a saved batch view (per-brand) after a switch/refresh, if present.
+async function restoreBatchView(batch) {
+  if (batch && batch.length) {
+    await refreshReviewIndex();
+    showBatchResults({ results: batch, batch_dir: '' });
+  }
+}
+
 function showBatchResults(data) {
   S.batch = data.results || [];
   S.results = S.batch;   // shared store so ✨ Suggest / re-render work by index
@@ -4090,23 +4649,7 @@ function showBatchResults(data) {
       <div style="flex:1"></div>
       <button class="btn btn-ghost btn-sm" onclick="renderStoriesList(S.stories)">← Back to stories</button>
     </div>
-    ${data.results.map((r,ri) => r.ok ? `
-      <div class="story-card">
-        <div class="s-top">
-          <span class="score-pill badge badge-info">${esc(S.formats[r.format]||r.format)}</span>
-          <span class="story-title">${esc(r.title)}</span>
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;">
-          ${r.files.map(f=>`<a href="/outputs/${r.rel}/${f}" target="_blank"><img src="/outputs/${r.rel}/${f}" style="height:120px;border-radius:5px;border:1px solid var(--border);"></a>`).join('')}
-        </div>
-        <div class="story-reason" style="white-space:pre-wrap;">${esc(r.caption)}</div>
-        <div class="story-actions" style="margin-top:8px;flex-wrap:wrap;">
-          ${(r.format==='carousel'||r.format==='listicle')
-            ? `<button class="btn btn-primary btn-sm" onclick="editBatchPlan(${ri})">✎ Edit in Editor</button>`
-            : `<button class="btn btn-green btn-sm" onclick="suggestForResult(${ri})">✨ Suggest images</button>`}
-          <a href="/outputs/${r.rel}/" target="_blank" class="btn btn-ghost btn-sm">Open folder ↗</a>
-        </div>
-      </div>` : `
+    ${data.results.map((r,ri) => r.ok ? resultCard(ri) : `
       <div class="story-card" style="border-color:var(--red);">
         <div class="s-top"><span class="score-pill badge badge-err">${esc(r.format)} failed</span><span class="story-title">${esc(r.title)}</span></div>
         <div class="story-reason" style="color:var(--red);">${esc(r.error||'')}</div>
@@ -4164,14 +4707,19 @@ async function useStor(i) {
     document.getElementById('hdr-timer').textContent = ((Date.now()-t0)/1000).toFixed(1)+'s';
   }, 200);
   try {
+    const planBrand = curBrand();   // the brand this plan is for
     const data = await api('/api/plan/generate', 'POST', {
       story: {title:s.title,summary:s.summary,url:s.url,published:s.published||'',image:s.image||''},
       total_slides: total,
       model,
       tone,
-      brand: curBrand(),
+      brand: planBrand,
     });
     document.getElementById('hdr-timer').textContent = data.elapsed+'s';
+    if (curBrand() !== planBrand) {   // switched brands mid-generate — plan stashed server-side
+      toast(`${planBrand} plan ready (saved) — you're on ${curBrand()} now`);
+      return;
+    }
     loadPlan(data.plan);
     showTab('editor', document.querySelectorAll('.nav-btn')[2]);
     toast(`Plan ready (${data.elapsed}s)`);
@@ -4187,11 +4735,54 @@ async function useStor(i) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Editor / Plan form
 // ═══════════════════════════════════════════════════════════════════════════
+function resetEditorView() {
+  S.plan = null;
+  S.imagePaths = {};
+  S.slideIdx = 0;
+  S.totalSlides = 0;
+  S.lastRender = null;
+  S.editingResultIndex = null;
+  g('plan-form').innerHTML = '<div style="color:var(--muted);text-align:center;padding:28px 10px;font-size:12px;line-height:1.7;">No plan loaded. Create a new post or load one from Library.</div>';
+  g('preview-wrap').innerHTML = '<div class="preview-placeholder">Load a plan and click Preview</div>';
+  updateCnt();
+}
+
+async function clearEditorSession() {
+  if (S.busy) { toast(`Wait - '${S.busy}' is still running`, 'err'); return; }
+  if (!confirm('Clear the current Editor plan and its session images? Saved Library items and rendered outputs will stay.')) return;
+  try {
+    await api('/api/session/clear', 'POST', {scope:'editor'});
+    resetEditorView();
+    toast('Editor session cleared');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
+async function clearCreateSession() {
+  if (S.busy) { toast(`Wait - '${S.busy}' is still running`, 'err'); return; }
+  if (!confirm('Start fresh for this brand? This clears the current Create, Editor, fetched stories and generated-result session. Library items and rendered outputs will stay.')) return;
+  try {
+    await api('/api/session/clear', 'POST', {scope:'all'});
+    resetEditorView();
+    S.stories = []; S.batch = []; S.results = []; S.selected = {};
+    S.manualImages = [];
+    ['m-idea','m-notes','m-tone'].forEach(id => { if (g(id)) g(id).value = ''; });
+    if (g('m-platform')) g('m-platform').value = 'instagram';
+    if (g('m-slides')) g('m-slides').value = String(SETTINGS.slides || 4);
+    if (g('m-angles')) g('m-angles').innerHTML = '';
+    renderManualImages(); updateManualContext();
+    if (g('batch-bar')) g('batch-bar').style.display = 'none';
+    if (g('stories-list')) g('stories-list').innerHTML = '<div style="color:var(--muted);text-align:center;padding:40px;font-size:13px;">Session cleared. Fetch stories when you want to start again.</div>';
+    toast('Fresh session ready');
+  } catch(e) { toast(e.message, 'err'); }
+}
+
 function loadPlan(plan) {
   S.plan = plan;
   S.imagePaths = {};
+  S.editingResultIndex = null;   // reset the batch-card link; editResultPlan() re-sets it after calling this
   S.slideIdx = 0;
   S.totalSlides = 1 + (plan.content_slides||[]).length + 1;
+  if (g('slide-count-sel')) g('slide-count-sel').value = String(S.totalSlides);
   renderForm(plan);
   updateCnt();
   document.getElementById('preview-wrap').innerHTML = '<div class="preview-placeholder">Click Preview to render slide</div>';
@@ -4380,7 +4971,7 @@ async function previewCurrent() {
   try {
     const blob = await fetch(`/api/preview/${S.slideIdx}?brand=${encodeURIComponent(curBrand())}`).then(r=>{if(!r.ok)throw new Error('render failed');return r.blob();});
     const url  = URL.createObjectURL(blob);
-    wrap.innerHTML = `<div style="position:relative;display:inline-block;max-width:100%;max-height:100%;">
+    wrap.innerHTML = `<div class="preview-image-shell">
       <img src="${url}" alt="slide ${S.slideIdx}">
       <button class="btn btn-ghost btn-sm" onclick="copyImageUrl('${url}','Slide')" title="Copy this slide image to clipboard"
               style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.65);">📋 Copy</button>
@@ -4522,6 +5113,42 @@ document.addEventListener('paste', (e) => {
 });
 
 // ═══ Create (Manual) ═══════════════════════════════════════════════════════
+const MANUAL_PLATFORM_HINTS = {
+  instagram: 'short, visual, mobile-friendly slides with a save, share, follow or DM CTA',
+  linkedin: 'professional, insight-led copy with business relevance and a restrained CTA',
+  facebook: 'conversational, context-rich copy designed to invite a natural discussion',
+  x: 'very concise, direct copy with a caption under 240 characters',
+};
+const MANUAL_TYPE_HINTS = {
+  educational: 'practical steps, principles or mistakes the reader can act on',
+  thought_leadership: 'a clear point of view, supporting reasoning and a useful implication',
+  promotional: 'audience benefits, the problem solved and one conversion-focused CTA',
+  announcement: 'what is new, who it affects, why it matters and what happens next',
+  case_study: 'the problem, approach and real result or lesson without invented metrics',
+  storytelling: 'a grounded hook, turning point and useful lesson',
+};
+function updateManualContentTypes(brand){
+  const sel = g('m-content-type');
+  if(!sel) return;
+  const types = Array.isArray(brand?.content_types) ? brand.content_types : [];
+  const previous = sel.value;
+  sel.innerHTML = types.length
+    ? types.map(t => `<option value="${esc(t.value)}">${esc(t.label)}</option>`).join('')
+    : '<option value="general">General post</option>';
+  if(types.some(t => t.value === previous)) sel.value = previous;
+  updateManualContext();
+}
+function updateManualContext(){
+  const platform = g('m-platform')?.value || 'instagram';
+  const type = g('m-content-type')?.value || 'general';
+  const platformName = g('m-platform')?.selectedOptions?.[0]?.textContent || 'Instagram';
+  const typeName = g('m-content-type')?.selectedOptions?.[0]?.textContent || 'General post';
+  const typeSpec = (S.brandInfo?.content_types || []).find(t => t.value === type);
+  const typeHint = typeSpec?.description || MANUAL_TYPE_HINTS[type] || 'use the clearest framing for the supplied material';
+  const hint = g('m-context-hint');
+  if(hint) hint.textContent = `${platformName} · ${typeName}: ${typeHint} ${MANUAL_PLATFORM_HINTS[platform]}.`;
+}
+
 function manualAddImages(input){
   S.manualImages = S.manualImages || [];
   for (const f of input.files) if (f.type.startsWith('image/')) S.manualImages.push(f);
@@ -4548,7 +5175,13 @@ async function manualSuggest(){
   if(!idea){ toast('Type a rough idea first','err'); g('m-idea')?.focus(); return; }
   const btn = g('m-suggest-btn'); const lbl = btn.innerHTML; btn.disabled=true; btn.innerHTML='<span class="spin"></span> Thinking…';
   try {
-    const data = await api('/api/manual/suggest','POST',{idea, tone:g('m-tone')?.value||'', brand:curBrand()});
+    const data = await api('/api/manual/suggest','POST',{
+      idea,
+      tone:g('m-tone')?.value||'',
+      platform:g('m-platform')?.value||'instagram',
+      content_type:g('m-content-type')?.value||'general',
+      brand:curBrand(),
+    });
     const angles = data.angles || [];
     const box = g('m-angles');
     box.innerHTML = angles.length
@@ -4565,12 +5198,19 @@ async function manualGenerate(){
   const notes  = (g('m-notes')?.value||'').trim();
   const slides = parseInt(g('m-slides')?.value||'4');
   const tone   = (g('m-tone')?.value||'').trim();
-  const btn = g('m-gen'); const lbl = btn.innerHTML; btn.disabled=true; btn.innerHTML='<span class="spin"></span> Generating…';
-  const t0=Date.now(); const tid=setInterval(()=>{ const h=g('hdr-timer'); if(h) h.textContent=((Date.now()-t0)/1000).toFixed(1)+'s'; },200);
+  const platform = g('m-platform')?.value||'instagram';
+  const contentType = g('m-content-type')?.value||'general';
+  const btn = g('m-gen'); const lbl = btn.innerHTML; btn.disabled=true; btn.innerHTML='<span class="spin"></span> Writing post…';
+  const t0=Date.now(); const tid=setInterval(()=>{
+    const elapsed = (Date.now()-t0)/1000;
+    const h=g('hdr-timer'); if(h) h.textContent=elapsed.toFixed(1)+'s';
+    if(elapsed > 45) btn.innerHTML='<span class="spin"></span> Still writing — local AI can take a minute…';
+  },200);
   try {
     const data = await api('/api/plan/generate','POST',{
       story:{title:idea, summary: notes||idea, url:'', published:'', image:''},
-      total_slides: slides, model: g('model-sel')?.value||'', tone, brand: curBrand(),
+      total_slides: slides, model: g('model-sel')?.value||'', tone,
+      platform, content_type:contentType, manual:true, brand: curBrand(),
     });
     clearInterval(tid); const h=g('hdr-timer'); if(h) h.textContent=data.elapsed+'s';
     loadPlan(data.plan);
@@ -4735,6 +5375,19 @@ async function renderFull() {
     toast(`✓ Rendered ${data.files.length} slides in ${data.elapsed}s`);
     notify('Carousel rendered', `${data.files.length} slides saved in ${data.elapsed}s`);
     S.lastRender = {rel:data.rel, files:data.files};
+    // If this render came from "Edit in Editor" on a Bulk/Batch result card, sync
+    // that card's thumbnails + "NO IMAGE" badge in place — otherwise they'd keep
+    // showing the stale pre-edit state (wrong files AND a badge that never clears).
+    if (S.editingResultIndex != null && S.results && S.results[S.editingResultIndex]) {
+      const idx = S.editingResultIndex;
+      const rr = S.results[idx];
+      rr.rel = data.rel; rr.files = data.files;
+      rr.has_images = Object.values(S.imagePaths || {}).some(Boolean);
+      const imgsEl = g('rc-imgs-'+idx);
+      if (imgsEl) imgsEl.innerHTML = rr.files.map(f=>`<a href="/outputs/${rr.rel}/${f}?t=${Date.now()}" target="_blank"><img src="/outputs/${rr.rel}/${f}?t=${Date.now()}" style="height:120px;border-radius:5px;border:1px solid var(--border);"></a>`).join('');
+      const noImgEl = g('rc-noimg-'+idx);
+      if (noImgEl) noImgEl.style.display = rr.has_images ? 'none' : '';
+    }
     g('preview-wrap').innerHTML=`
       <div style="text-align:center;padding:16px;line-height:1.8;">
         <div style="font-size:16px;font-weight:700;color:var(--green);margin-bottom:6px;">Carousel saved!</div>
@@ -4774,6 +5427,13 @@ async function sendEditorToReview(btn) {
     });
     toast('Sent to Review ✓');
     if (btn) { btn.disabled=true; btn.innerHTML='✓ Sent to Review'; }
+    // Reflect on the originating Bulk/Batch card, if this editor session came from one.
+    if (S.editingResultIndex != null) {
+      if (!S.reviewIndex) S.reviewIndex = {};
+      S.reviewIndex[S.lastRender.rel] = 'pending';
+      const badge = g('rc-badge-' + S.editingResultIndex);
+      if (badge) badge.innerHTML = reviewBadgeHtml(S.lastRender.rel);
+    }
   } catch(e) {
     toast(e.message,'err');
     if (btn) { btn.disabled=false; btn.innerHTML='✓ Send to Review'; }
@@ -4791,6 +5451,9 @@ async function sendResultToReview(ri, btn) {
     });
     toast('Sent to Review ✓');
     if (btn) { btn.disabled=true; btn.innerHTML='✓ Sent'; }
+    S.reviewIndex[r.rel] = 'pending';                        // reflect it immediately…
+    const badge = g('rc-badge-' + ri);
+    if (badge) badge.innerHTML = reviewBadgeHtml(r.rel);      // …without a full list re-render
   } catch(e) {
     toast(e.message,'err');
     if (btn) { btn.disabled=false; btn.innerHTML='✓ Send to Review'; }

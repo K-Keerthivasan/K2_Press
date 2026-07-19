@@ -97,6 +97,21 @@ brands:
     personality: >
       Describe your brand voice. The AI rewrites copy in this voice on a final
       pass. Mention tone, what to emphasise, and words/styles to avoid.
+    scoring_guidance: >
+      Prioritize stories that match the brand's niche and audience. Reward content
+      that can be turned into a clear, engaging post and penalize off-topic material.
+    # The Create tab shows this brand-specific list. Each value must have matching
+    # guidance in plan.py's CONTENT_TYPE_GUIDANCE registry.
+    content_types:
+      - value: educational
+        label: "Educational / how-to"
+        description: "Teach the audience something practical they can use."
+      - value: thought_leadership
+        label: "Thought leadership / opinion"
+        description: "Present a clear position and explain why it matters."
+      - value: promotional
+        label: "Promotional / offer"
+        description: "Connect an offer to the audience problem and benefit."
     feeds:
       categories:
         tech:

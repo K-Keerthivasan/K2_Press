@@ -160,17 +160,29 @@ def _scene_cuts(path: Path, threshold: float) -> list[float]:
 # ── 4. Ollama copy generation ───────────────────────────────────────────────────
 
 def gen_card_copy(title: str, description: str, brand: dict, *, model: str | None = None) -> dict:
-    """Ask the LLM for the three cards' copy (hook / title / cta) as JSON."""
+    """Ask the LLM for the three cards' copy (hook / title / cta) as JSON, written
+    in THIS brand's voice — driven by the brand's personality + profile from config
+    (no hardcoded tone; a gaming page and a B2B agency read differently)."""
     from llm import chat_json
-    bname = brand.get("name", "the brand")
-    handle = brand.get("handle", "")
+    bname   = brand.get("name", "the brand")
+    handle  = brand.get("handle", "")
+    persona = (brand.get("personality") or "").strip()
+    profile = (brand.get("profile") or "").strip()
+    voice = ""
+    if persona:
+        voice += f"\nBRAND VOICE (write in this voice):\n{persona}\n"
+    if profile:
+        voice += f"\nBRAND / NICHE & AUDIENCE:\n{profile}\n"
     system = (
-        f"You write punchy 9:16 short-form video copy for {bname} ({handle}).\n"
+        f"You write short-form 9:16 video copy for {bname} ({handle}).\n"
+        f"{voice}"
         "You are given a YouTube video's title and description. Produce copy for a "
-        "3-card branded clip: a HOOK card, a TITLE card, and a CTA card.\n"
-        "Rules: hook is a scroll-stopping line; title names the subject; CTA invites a "
-        "follow. Keep each line short (fits a phone screen). Pick 1-3 highlight keywords "
-        "per card (exact substrings of that card's text). Return ONLY valid JSON:\n"
+        "3-card branded clip — a HOOK card, a TITLE card, and a CTA card — IN THIS BRAND'S "
+        "VOICE and for its audience.\n"
+        "Rules: hook is a scroll-stopping opener; title names the subject; CTA invites a "
+        "follow. Keep each line short (fits a phone screen). Match the brand's tone above — "
+        "do NOT default to a generic hype/gaming voice unless that is the brand. Pick 1-3 "
+        "highlight keywords per card (exact substrings of that card's text). Return ONLY valid JSON:\n"
         '{"hook": {"lead": "<2-4 word kicker>", "body": "<one punchy sentence>", '
         '"highlight": ["..."], "emoji": "<one emoji>"}, '
         '"title": {"title": "<subject>", "subtitle": "<short descriptor>", "highlight": ["..."]}, '
@@ -186,8 +198,10 @@ def gen_card_copy(title: str, description: str, brand: dict, *, model: str | Non
 # ── 5. manifest ─────────────────────────────────────────────────────────────────
 
 def build_manifest(source: dict, copy: dict, clips: list[dict], *, mode: str,
-                   brand: dict, brand_key: str) -> dict:
+                   brand: dict, brand_key: str, aspect: str = "9:16") -> dict:
     h, t, c = copy.get("hook", {}), copy.get("title", {}), copy.get("cta", {})
+    # Per-card crop defaults: hook letterboxes, title/cta fill (cover-crop), centred.
+    def _crop(fit): return {"fit": fit, "zoom": 1.0, "x": 0.5, "y": 0.5}
     return {
         "source": {
             "channel_rss": source.get("channel_rss", ""),
@@ -198,17 +212,18 @@ def build_manifest(source: dict, copy: dict, clips: list[dict], *, mode: str,
             "rights_cleared": bool(source.get("rights_cleared", False)),
         },
         "output_mode": mode,
+        "aspect": aspect,                 # 9:16 | 4:5 | 1:1 | 16:9
         "brand": {"key": brand_key, "palette": brand_key,
                   "handle": brand.get("handle", ""), "font": "Calibri"},
         "audio": {"use_source_audio": True, "music_path": None, "rights_cleared": False},
         "cards": [
-            {"id": "hook", "template": "hook", "clip": clips[0],
+            {"id": "hook", "template": "hook", "clip": clips[0], "crop": _crop("fit"),
              "text": {"lead": h.get("lead", "Check this out:"), "body": h.get("body", source.get("title", "")),
                       "highlight": h.get("highlight", []), "emoji": h.get("emoji", "")}},
-            {"id": "title", "template": "title", "clip": clips[1],
+            {"id": "title", "template": "title", "clip": clips[1], "crop": _crop("fill"),
              "text": {"title": t.get("title", source.get("title", "")), "subtitle": t.get("subtitle", ""),
                       "highlight": t.get("highlight", [])}},
-            {"id": "cta", "template": "cta", "clip": clips[2],
+            {"id": "cta", "template": "cta", "clip": clips[2], "crop": _crop("fill"),
              "text": {"body": c.get("body", f"Follow {brand.get('handle','')} for more"),
                       "highlight": c.get("highlight", [])}},
         ],
@@ -217,7 +232,7 @@ def build_manifest(source: dict, copy: dict, clips: list[dict], *, mode: str,
 
 def emit_manifest(*, rss: str = "", video_id: str = "", url: str = "", mode: str = "carousel",
                   clip_method: str = "even_intervals", cards: int = 3, out_path: str,
-                  model: str | None = None, brand_key: str | None = None,
+                  aspect: str = "9:16", model: str | None = None, brand_key: str | None = None,
                   config: dict | None = None) -> dict:
     config = config or load_config()
     vr = _vr_cfg(config)
@@ -250,7 +265,8 @@ def emit_manifest(*, rss: str = "", video_id: str = "", url: str = "", mode: str
                          clip_seconds=float(vr["default_clip_seconds"]),
                          source_path=source_path, threshold=float(vr["scene_threshold"]))
     copy = gen_card_copy(source.get("title", ""), meta["description"], brand, model=model)
-    manifest = build_manifest(source, copy, clips, mode=mode, brand=brand, brand_key=bkey)
+    manifest = build_manifest(source, copy, clips, mode=mode, brand=brand,
+                              brand_key=bkey, aspect=aspect)
 
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -281,7 +297,8 @@ def _highlight_html(text: str, words: list[str], handle: str = "") -> str:
 
 # ── 7. overlay render + ffmpeg composite ────────────────────────────────────────
 
-def render_card_overlay(card: dict, brand: dict, dest: Path) -> Path:
+def render_card_overlay(card: dict, brand: dict, dest: Path, *,
+                        width: int = V.W, height: int = V.H) -> Path:
     handle = brand.get("handle", "")
     logo = Path(brand.get("logo_path", "static/logo.png")).resolve().as_uri()
     txt = card.get("text", {})
@@ -299,7 +316,7 @@ def render_card_overlay(card: dict, brand: dict, dest: Path) -> Path:
     else:  # cta
         vars_ = {**base, "body_html": _highlight_html(txt.get("body", ""), hl, handle)}
 
-    png = render_overlay_to_bytes(tmpl, vars_, V.W, V.H)
+    png = render_overlay_to_bytes(tmpl, vars_, width, height)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(png)
     return dest
@@ -307,19 +324,30 @@ def render_card_overlay(card: dict, brand: dict, dest: Path) -> Path:
 
 def composite_card(source_path: Path, start: float, duration: float,
                    overlay_png: Path, out_path: Path, *, template: str,
-                   use_audio: bool = True) -> Path:
-    """Trim [start, start+duration] out of the full-resolution source via input
-    seek, scale/crop to 9:16, dim/letterbox per template, composite the
-    transparent overlay PNG, encode H.264."""
-    letterbox = (template == "hook")
-    dim = 0.45 if template == "cta" else 0.0
+                   width: int = V.W, height: int = V.H, crop: dict | None = None,
+                   bg: str = "0A0F1E", use_audio: bool = True) -> Path:
+    """Trim [start, start+duration] from the source, frame it to width×height
+    per the card's crop settings, composite the overlay PNG, encode H.264.
 
-    if letterbox:
-        base = (f"[0:v]scale={V.W}:{V.H}:force_original_aspect_ratio=decrease,"
-                f"pad={V.W}:{V.H}:(ow-iw)/2:(oh-ih)/2:color=0x0A0F1E,setsar=1[b]")
-    else:
-        base = (f"[0:v]scale={V.W}:{V.H}:force_original_aspect_ratio=increase,"
-                f"crop={V.W}:{V.H},setsar=1[b]")
+    crop = {fit: "fill"|"fit", zoom: >=1, x: 0..1, y: 0..1, dim: 0..1}
+      fill = cover-crop (zoom in + pick focal point); fit = letterbox (whole frame).
+      x/y = focal point (0,0 = top-left; 0.5,0.5 = centre; 0.5,1 = bottom-centre).
+    Defaults: hook letterboxes, title fills, cta fills + dims for legibility.
+    """
+    crop = crop or {}
+    fit  = (crop.get("fit") or ("fit" if template == "hook" else "fill")).lower()
+    zoom = max(1.0, float(crop.get("zoom", 1.0)))
+    fx   = min(1.0, max(0.0, float(crop.get("x", 0.5))))
+    fy   = min(1.0, max(0.0, float(crop.get("y", 0.5))))
+    dim  = float(crop["dim"]) if "dim" in crop else (0.45 if template == "cta" else 0.0)
+
+    if fit == "fit":
+        base = (f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x{bg},setsar=1[b]")
+    else:  # fill (cover-crop) with optional zoom + focal point
+        sw, sh = int(width * zoom), int(height * zoom)
+        base = (f"[0:v]scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height}:(iw-{width})*{fx:.3f}:(ih-{height})*{fy:.3f},setsar=1[b]")
     parts, last = [base], "b"
     if dim > 0:
         parts.append(f"[{last}]drawbox=x=0:y=0:w=iw:h=ih:color=0x000000@{dim:.3f}:t=fill[d]"); last = "d"
@@ -369,6 +397,9 @@ def render_from_manifest(path: str, *, send: bool = False, config: dict | None =
             "true in the manifest (you assert rights), or add the channel to "
             "config.yaml video_reels.allowlist.")
 
+    aspect = manifest.get("aspect", "9:16")
+    w, h = V.dims_for_aspect(aspect)
+    bg = V._hex((brand.get("theme") or {}).get("navy", "#0A0F1E"))   # letterbox colour
     vid = source.get("video_id") or _video_id_from_url(source.get("url", ""))
     stem = f"{bkey}_{vid or 'vr'}"
     cards = manifest.get("cards", [])
@@ -382,10 +413,12 @@ def render_from_manifest(path: str, *, send: bool = False, config: dict | None =
         clip = card.get("clip", {})
         start = float(clip.get("start", 0))
         dur = float(clip.get("duration", 4.0))
-        overlay = render_card_overlay(card, brand, OVL_DIR / f"{stem}_{n}_{card['id']}.png")
+        overlay = render_card_overlay(card, brand, OVL_DIR / f"{stem}_{n}_{card['id']}.png",
+                                      width=w, height=h)
         out = composite_card(full, start, dur, overlay,
                              VR_DIR / f"{stem}_{n}_{card['id']}.mp4",
-                             template=card["template"], use_audio=use_audio)
+                             template=card["template"], width=w, height=h,
+                             crop=card.get("crop"), bg=bg, use_audio=use_audio)
         card_mp4s.append(out)
 
     if mode == "reel":
@@ -423,6 +456,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--video-id", default="", help="explicit YouTube video id")
     ap.add_argument("--url", default="", help="explicit YouTube video url")
     ap.add_argument("--mode", choices=["carousel", "reel"], default="carousel")
+    ap.add_argument("--aspect", choices=["9:16", "4:5", "1:1", "16:9"], default="9:16",
+                    help="output aspect ratio")
     ap.add_argument("--clip-method", choices=["even_intervals", "scene_cut", "manual"],
                     default="even_intervals")
     ap.add_argument("--cards", type=int, default=3)
@@ -454,7 +489,7 @@ def main(argv: list[str] | None = None) -> int:
         # emit (or dry-run) a manifest
         if args.dry_run:
             m = emit_manifest(rss=args.rss, video_id=args.video_id, url=args.url, mode=args.mode,
-                              clip_method=args.clip_method, cards=args.cards,
+                              clip_method=args.clip_method, cards=args.cards, aspect=args.aspect,
                               out_path=str(Path(MANIFEST_DIR) / "_dryrun.json"),
                               model=args.model or None, brand_key=args.brand or None)
             Path(MANIFEST_DIR / "_dryrun.json").unlink(missing_ok=True)
@@ -463,8 +498,8 @@ def main(argv: list[str] | None = None) -> int:
 
         out = args.emit_manifest or str(MANIFEST_DIR / "manifest.json")
         m = emit_manifest(rss=args.rss, video_id=args.video_id, url=args.url, mode=args.mode,
-                          clip_method=args.clip_method, cards=args.cards, out_path=out,
-                          model=args.model or None, brand_key=args.brand or None)
+                          clip_method=args.clip_method, cards=args.cards, aspect=args.aspect,
+                          out_path=out, model=args.model or None, brand_key=args.brand or None)
         print(f"Manifest written → {out}")
         print(f"  source: {m['source']['title']}  ({m['source']['url']})")
         print(f"  rights_cleared: {m['source']['rights_cleared']}  mode: {m['output_mode']}")

@@ -12,6 +12,173 @@ from llm import chat_json
 PROFILE_PATH = Path("content_profile.md")
 
 
+PLATFORM_GUIDANCE = {
+    "instagram": {
+        "name": "Instagram",
+        "caption": "3-4 concise sentences with a strong opening line",
+        "hashtags": 10,
+        "rules": (
+            "Make every slide highly visual and easy to scan on a phone. "
+            "Use short, punchy copy and a save, share, follow, or DM call to action."
+        ),
+    },
+    "linkedin": {
+        "name": "LinkedIn",
+        "caption": "4-7 short, professional paragraphs with generous line breaks",
+        "hashtags": 3,
+        "rules": (
+            "Write for a professional audience. Prioritise credible insight, business relevance, "
+            "and a useful takeaway; avoid Instagram-style hype and engagement bait."
+        ),
+    },
+    "facebook": {
+        "name": "Facebook",
+        "caption": "2-4 conversational paragraphs that provide enough context on their own",
+        "hashtags": 3,
+        "rules": (
+            "Use approachable, community-friendly language. Make the post understandable without "
+            "swiping first and favour a natural question or discussion prompt when appropriate."
+        ),
+    },
+    "x": {
+        "name": "X",
+        "caption": "one sharp post under 240 characters",
+        "hashtags": 2,
+        "rules": (
+            "Be exceptionally concise and direct. Keep graphic copy sparse, lead with the strongest "
+            "claim, and avoid filler, long setup, and more than one call to action."
+        ),
+    },
+}
+
+
+CONTENT_TYPE_GUIDANCE = {
+    "general": (
+        "Choose the clearest, most useful framing for the supplied material. Preserve its core "
+        "meaning and do not force it into a promotional, opinion, or tutorial structure."
+    ),
+    "educational": (
+        "Teach something practical. Organise the post into clear steps, principles, or mistakes, "
+        "and make every slide give the reader an actionable takeaway."
+    ),
+    "thought_leadership": (
+        "Express a clear, defensible point of view. Explain why it matters, support it with the "
+        "provided facts, and end with a useful implication for the audience."
+    ),
+    "promotional": (
+        "Present the offer through audience benefits and a concrete problem it solves. Do not invent "
+        "features, proof, pricing, urgency, or results; use one direct conversion-focused CTA."
+    ),
+    "announcement": (
+        "Lead with what is new, then explain who it affects, why it matters, and what the audience "
+        "should do next. Keep the news clear instead of teasing it."
+    ),
+    "case_study": (
+        "Structure the story as problem, approach, and result or lesson. Use only outcomes present in "
+        "the supplied notes and never fabricate client names, metrics, quotes, or evidence."
+    ),
+    "storytelling": (
+        "Build a concise narrative with a hook, tension or turning point, and a useful lesson. Keep the "
+        "story grounded in the supplied information rather than inventing anecdotes."
+    ),
+    # K2 Digital Media
+    "business_tip": (
+        "Teach a practical lesson for a busy local business owner. Connect every recommendation to a "
+        "concrete outcome such as leads, trust, speed, rankings, bookings, retention, or saved spend."
+    ),
+    "service_spotlight": (
+        "Explain the audience problem first, then show how the relevant K2 service solves it and what "
+        "business benefit it creates. Do not invent features, pricing, proof, urgency, or results."
+    ),
+    "industry_insight": (
+        "Interpret the trend instead of merely reporting it. Explain what it changes for small and "
+        "mid-sized businesses and give a practical next step."
+    ),
+    "project_showcase": (
+        "Show the work through its goal, the reasoning or craft behind it, and the value delivered. "
+        "Use only project details and outcomes supplied by the user."
+    ),
+    "company_announcement": (
+        "Lead clearly with the K2 update, then explain who it affects, why it matters, and the one next "
+        "action. Avoid inflated milestone language."
+    ),
+    # JKR
+    "breaking_news": (
+        "Lead with what happened, then quickly explain why it matters to players or viewers. Separate "
+        "confirmed facts from rumours and do not bury the news behind a tease."
+    ),
+    "review": (
+        "Give a clear verdict supported by specific strengths, weaknesses, and audience fit. Do not "
+        "invent hands-on experience, scores, quotes, or details not supplied by the user."
+    ),
+    "reaction": (
+        "Take a confident fan-first position, identify the stakes, and support the reaction with concrete "
+        "reasoning. Be punchy without manufacturing outrage or hype."
+    ),
+    "trailer_breakdown": (
+        "Pull out the most important reveals, details, and implications in a logical order. Clearly mark "
+        "interpretation or speculation and avoid presenting theories as confirmed facts."
+    ),
+    "ranking": (
+        "Create a punchy ranked or curated list. Give a distinct, specific reason for every choice and "
+        "make the ranking criteria clear."
+    ),
+    "explainer": (
+        "Make the subject easy for fans to follow by clarifying the essential context, connections, and "
+        "takeaway without turning the post into a dry encyclopedia summary."
+    ),
+    "recommendation": (
+        "Recommend what to play or watch, explain exactly why, identify who it best suits, and mention "
+        "any relevant caveat supported by the supplied information."
+    ),
+}
+
+
+CONTENT_TYPE_LABELS = {
+    "general": "General",
+    "educational": "Educational / how-to",
+    "thought_leadership": "Thought leadership / opinion",
+    "promotional": "Promotional / offer",
+    "announcement": "Announcement / update",
+    "case_study": "Case study / results",
+    "storytelling": "Storytelling / lesson",
+    "business_tip": "Business tip / how-to",
+    "service_spotlight": "Service spotlight / offer",
+    "industry_insight": "Industry insight / trend",
+    "project_showcase": "Project showcase / portfolio",
+    "company_announcement": "Company announcement / update",
+    "breaking_news": "Breaking news / update",
+    "review": "Review / verdict",
+    "reaction": "Reaction / hot take",
+    "trailer_breakdown": "Trailer / reveal breakdown",
+    "ranking": "Ranking / list",
+    "explainer": "Explainer / lore",
+    "recommendation": "Recommendation / what to play or watch",
+}
+
+
+def _content_context(platform: str, content_type: str, brand_tags: list) -> dict:
+    """Return safe platform/content-purpose prompt settings with stable defaults."""
+    platform = (platform or "instagram").strip().lower()
+    content_type = (content_type or "general").strip().lower()
+    if platform not in PLATFORM_GUIDANCE:
+        platform = "instagram"
+    if content_type not in CONTENT_TYPE_GUIDANCE:
+        content_type = "general"
+    platform_spec = PLATFORM_GUIDANCE[platform]
+    tags = list(brand_tags or ["news"])[:platform_spec["hashtags"]]
+    return {
+        "platform": platform,
+        "platform_name": platform_spec["name"],
+        "caption_rule": platform_spec["caption"],
+        "platform_rules": platform_spec["rules"],
+        "content_type": content_type,
+        "content_label": CONTENT_TYPE_LABELS.get(content_type, content_type.replace("_", " ").title()),
+        "content_rules": CONTENT_TYPE_GUIDANCE[content_type],
+        "tags": json.dumps(tags),
+    }
+
+
 def _profile() -> str:
     return PROFILE_PATH.read_text(encoding="utf-8")
 
@@ -118,7 +285,7 @@ EDITING RULES:
         f"{json.dumps(plan, ensure_ascii=False)}"
     )
     try:
-        edited = chat_json(system, user, model=model, retries=0)
+        edited = chat_json(system, user, model=model, retries=1)  # Retry once for consistency
     except Exception as exc:
         print(f"[plan] personality polish skipped: {exc}")
         return plan
@@ -143,6 +310,10 @@ def plan_story(
     model: str | None = None,
     brand: dict | None = None,
     tone: str = "",                    # per-post stance (positive/negative/…)
+    platform: str = "instagram",
+    content_type: str = "general",
+    polish_personality: bool = True,
+    manual_mode: bool = False,
 ) -> dict:
     if config is None:
         config = load_config()
@@ -162,7 +333,8 @@ def plan_story(
     brand_name = brand.get("name", "the brand")
     handle     = brand.get("handle", "@handle")
     profile    = (brand.get("profile") or "").strip() or _safe_profile()
-    tags       = json.dumps(brand.get("hashtags", ["news"]))
+    content_ctx = _content_context(platform, content_type, brand.get("hashtags", ["news"]))
+    tags       = content_ctx["tags"]
     location   = brand.get("location", "")
     loc_rule   = (f"- Make {location} relevance explicit when it is not obvious.\n"
                   if location else "")
@@ -170,14 +342,34 @@ def plan_story(
     eff_tone   = (tone or brand.get("tone") or "").strip()
     extra_ctx  = _tone_directive(eff_tone)
     voice_ctx  = _voice_block(brand)
+    source_rules = ""
+    if manual_mode:
+        source_rules = """
+MANUAL SOURCE ISOLATION:
+- This is a manual brief, not an RSS or news-feed story.
+- Use ONLY the idea and notes in the MANUAL BRIEF below as factual source material.
+- Do not use stored stories, previous posts, RSS content, remembered current events, or outside facts.
+- Do not invent release dates, announcements, quotes, statistics, features, results, or plot details.
+- If the notes are sparse, stay general and useful instead of filling gaps with unrelated news.
+- Never replace the user's topic with a different or more newsworthy topic.
+"""
 
-    system = f"""You are an Instagram carousel content planner for {brand_name}.
+    system = f"""You are a {content_ctx['platform_name']} carousel content planner for {brand_name}.
 You write clear, value-first posts — no fluff, no hype.
 
 CREATOR PROFILE:
 {profile}
 {voice_ctx}
 {extra_ctx}
+TARGET PLATFORM: {content_ctx['platform_name']}
+PLATFORM DIRECTION:
+{content_ctx['platform_rules']}
+
+CONTENT TYPE: {content_ctx['content_label']}
+CONTENT DIRECTION:
+{content_ctx['content_rules']}
+{source_rules}
+
 Return ONE valid JSON object (no markdown, no code fences) with EXACTLY these keys:
 {{
   "slug": "<kebab-case, max 40 chars>",
@@ -197,7 +389,7 @@ Return ONE valid JSON object (no markdown, no code fences) with EXACTLY these ke
     "cta":    "<single clear action, max 65 chars>",
     "handle": "{handle}"
   }},
-  "caption":    "<Instagram caption, 3-4 sentences, no hashtags>",
+  "caption":    "<{content_ctx['platform_name']} caption: {content_ctx['caption_rule']}, no hashtags>",
   "hashtags":   {tags},
   "dm_keyword": "<one word>"
 }}
@@ -206,19 +398,39 @@ RULES:
 - content_slides MUST have EXACTLY {n_content} items.
 - Every slide leads with value first, not background context.
 - CTA is ONE action only (follow / DM / save / share).
+- The copy, caption, and CTA MUST fit the selected platform and content type above.
 {loc_rule}- image_query must be a Pexels-compatible phrase (e.g. "city skyline night").
 - Body bullets use em-dash format: — point one\\n— point two"""
 
-    user = (
-        f"Story title:   {story.title}\n"
-        f"Story summary: {story.summary[:900]}\n"
-        f"Source URL:    {story.url}"
-    )
+    if manual_mode:
+        user = (
+            "MANUAL BRIEF — the only allowed source:\n"
+            f"Idea / topic: {story.title}\n"
+            f"User notes:   {story.summary[:900]}"
+        )
+    else:
+        user = (
+            f"Story title:   {story.title}\n"
+            f"Story summary: {story.summary[:900]}\n"
+            f"Source URL:    {story.url}"
+        )
 
     plan = chat_json(system, user, model=model)
+    plan["platform"] = content_ctx["platform"]
+    plan["content_type"] = content_ctx["content_type"]
+    plan["origin"] = "manual" if manual_mode else "rss"
     if eff_tone:
         plan["tone"] = eff_tone
-    return _stamp_source(_polish_personality(plan, story, brand, model, eff_tone), story)
+    # Manual Create already supplies the brand voice in the main prompt. It can
+    # skip the second full LLM rewrite to keep an interactive click responsive.
+    if polish_personality:
+        plan = _polish_personality(plan, story, brand, model, eff_tone)
+    # Never let extra model-generated slides override the requested count.
+    slides = plan.get("content_slides")
+    if isinstance(slides, list):
+        plan["content_slides"] = slides[:n_content]
+        plan["slide_count"] = 2 + len(plan["content_slides"])
+    return _stamp_source(plan, story)
 
 
 # ── Single-card formats (square / story / x) ─────────────────────────────────
@@ -480,7 +692,12 @@ RULES:
     plan.setdefault("format", "listicle")
     if ctx["eff_tone"]:
         plan["tone"] = ctx["eff_tone"]
-    return _stamp_source(_polish_personality(plan, story, brand, model, ctx["eff_tone"]), story)
+    plan = _polish_personality(plan, story, brand, model, ctx["eff_tone"])
+    slides = plan.get("content_slides")
+    if isinstance(slides, list):
+        plan["content_slides"] = slides[:n_items]
+        plan["slide_count"] = 2 + len(plan["content_slides"])
+    return _stamp_source(plan, story)
 
 
 def plan_post(
@@ -538,7 +755,12 @@ def regen_caption(plan: dict, brand: dict | None = None, config: dict | None = N
         from brands import resolve_brand
         brand = resolve_brand(config)
     brand_name = brand.get("name", "the brand")
-    tags       = json.dumps(brand.get("hashtags", ["news"]))
+    content_ctx = _content_context(
+        plan.get("platform", "instagram"),
+        plan.get("content_type", "general"),
+        brand.get("hashtags", ["news"]),
+    )
+    tags       = content_ctx["tags"]
     voice_ctx  = _voice_block(brand)
 
     parts: list[str] = []
@@ -550,11 +772,12 @@ def regen_caption(plan: dict, brand: dict | None = None, config: dict | None = N
     content = "\n".join(p for p in parts if p)
     tone_line = f"Desired tone: {tone}\n" if tone else ""
 
-    system = f"""You write Instagram captions for {brand_name}.
+    system = f"""You write {content_ctx['platform_name']} captions for {brand_name}.
 {voice_ctx}
 {tone_line}Return ONE valid JSON object (no markdown) with EXACTLY these keys:
-{{"caption": "<engaging 3-4 sentence caption, no hashtags>", "hashtags": {tags}}}
-Rules: caption is on-brand, personality-rich, and value-first; provide 6-12 relevant hashtags (lowercase, no #)."""
+{{"caption": "<{content_ctx['caption_rule']}, no hashtags>", "hashtags": {tags}}}
+Rules: caption is on-brand, personality-rich, and value-first. {content_ctx['platform_rules']}
+Keep no more than {PLATFORM_GUIDANCE[content_ctx['platform']]['hashtags']} relevant hashtags (lowercase, no #)."""
     user = f"Post content:\n{content[:1400]}"
     res  = chat_json(system, user, model=model)
     tags_out = res.get("hashtags", [])
